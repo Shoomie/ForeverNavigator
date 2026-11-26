@@ -2,7 +2,10 @@
 
 DISCLAIMER: This project is very new, and i'm not a professional data analyst. There will be bugs and quirks, but the project is in active development and i would appreciate any feedback or bug reports.
 
-A lightweight, ToS-safe, collaborative **2D/3D Raid Navigator, Tactical Whiteboard, Combat Log Analytics, and Synced Multi-Track Replay** framework for *World of Warcraft: Forever* (and Classic/Era).
+A ToS-safe, collaborative **2D/3D Dungeon/Raid Navigator, Tactical Whiteboard, Combat Log Analytics, and Synced Multi-Track Replay** framework for *World of Warcraft: Forever* (and Classic/Era).
+
+The basic functionality works in a few manually tested dungeons, and some outdoor areas.
+A neural net model is currently in development from a synthetic dataset from the game files, with the aim to be even more lightweight, yet with increased precision and stability.
 
 Built on top of the `MapNavigate` 28-dungeon native `1024×1024` minimap & GPU 3D WMO engine.
 
