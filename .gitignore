@@ -9,6 +9,7 @@ data/sessions/
 data/dev_gameplay/
 data/calibration/
 data/models/*_fp32.onnx
+data/.forever_navigator.pid
 data/synth_dataset/
 data/logs/
 data/cache/

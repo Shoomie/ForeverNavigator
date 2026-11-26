@@ -167,6 +167,7 @@ class MinimapTracker:
         self.last_smooth_px: Optional[Tuple[float, float]] = None
         self._last_neural_run_t: float = 0.0
         self._last_verify_run_t: float = 0.0
+        self._last_full_reacq_t: float = 0.0
         self._locked_zoom_yd: Optional[float] = None
         self._last_zoom_check_t: float = 0.0
         # Live per-engine telemetry (1.5s sliding window)
@@ -216,6 +217,7 @@ class MinimapTracker:
         self._jump_confirm_count: int = 0
         self._switch_cand_slug: Optional[str] = None
         self._switch_confirm_count: int = 0
+        self._switch_cand_since_t: float = 0.0
         self.trail_px: List[Tuple[int, int]] = []
         self.last_crop_rgb: Optional[np.ndarray] = None
         self._frame_count: int = 0
@@ -829,10 +831,11 @@ class MinimapTracker:
             top_k_cands = 8
 
         now_t = time.perf_counter()
-        dt_sec = 1.0 if self._last_update_t is None else float(np.clip(now_t - self._last_update_t, 0.2, 6.0))
+        dt_sec = 1.0 if self._last_update_t is None else float(np.clip(now_t - self._last_update_t, 0.05, 6.0))
         self._last_update_t = now_t
-        # Max physically plausible travel in dt_sec (covers 14 yd/s mount and ~35 yd/s flight paths)
-        plausible_yd = max(28.0, 42.0 * dt_sec + 15.0)
+        # Max physically plausible travel in dt_sec: covers 14 yd/s epic mount + 32-35 yd/s Classic flight paths
+        # + brief frame dips while still blocking cross-continent teleports without a loading screen.
+        plausible_yd = max(36.0, 55.0 * dt_sec + 20.0)
         tpl_cache: Optional[Dict[Tuple[int, float], Tuple[np.ndarray, np.ndarray]]] = (
             None if (self._executor is not None and self.high_precision) else {}
         )
@@ -873,14 +876,22 @@ class MinimapTracker:
                 prev_work_xy=prev_wxy, plausible_radius_work=plaus_w,
                 tpl_cache=tpl_cache,
             )
-            # If local match is weak on an already-locked zone, do an immediate full-map re-acquisition
-            if not force_full_map and prev_wxy is not None and sc < 0.50:
+            # If local match is weak on an already-locked zone, do a throttled full-map re-acquisition
+            # (at most once every 1.5s, using only the locked/mid scales so it takes ~20ms instead of 350ms!)
+            if (
+                not force_full_map
+                and prev_wxy is not None
+                and sc < 0.46
+                and (now_t - self._last_full_reacq_t) >= 1.5
+            ):
+                self._last_full_reacq_t = now_t
+                reacq_scales = (scales_px[0],) if len(scales_px) == 1 else scales_px[::2]
                 sc_full, xy_full = self._match_single_dungeon(
-                    slug, crop_sil, crop_edge, scales_px, angles_deg,
+                    slug, crop_sil, crop_edge, reacq_scales, angles_deg,
                     prev_work_xy=None, plausible_radius_work=None,
                     tpl_cache=tpl_cache,
                 )
-                if sc_full > sc + 0.08:
+                if sc_full > sc + 0.10:
                     sc, xy = sc_full, xy_full
             # If locked-scale match dipped, immediately fall back to full multi-scale check
             if use_locked_scale and sc < 0.52:
@@ -954,14 +965,15 @@ class MinimapTracker:
             raw_scores[active_slug] = 0.35
             ratio_a = self._scale_ratio.get(active_slug, 1.0)
             best_xy_by_slug[active_slug] = (float(self._smooth_px[0]) / ratio_a, float(self._smooth_px[1]) / ratio_a)
-        elif neural_pred is not None and neural_pred.best_prob >= 0.45 and neural_pred.best_slug in self.dungeons:
-            # Hybrid Neural Fast-Path (~3-10 ms total -> sustains 30-60 Hz polling on CPU!):
-            # If neural model strongly agrees with our already-locked active_slug, only refine active_slug locally!
+        elif neural_pred is not None and neural_pred.best_slug in self.dungeons:
+            # Hybrid Neural Fast-Path: NEVER fall back to scanning all 35+ cached maps on CPU (~1.8s freeze!)
+            # when Neural AI is enabled! Even at moderate confidence (0.25..0.45 while flying over water/trees),
+            # only refine active_slug + top-2 neural candidates (~8-25 ms total!).
             ran_cv = True
             prob_map = dict(neural_pred.top_slugs)
             if (
                 neural_pred.best_slug == active_slug
-                and neural_pred.best_prob >= 0.55
+                and neural_pred.best_prob >= 0.45
                 and self._smooth_px is not None
             ):
                 do_anchor = self.periodic_anchor and ((now_t - self._last_anchor_t) >= self.anchor_interval_sec)
@@ -978,8 +990,8 @@ class MinimapTracker:
                     if s != active_slug:
                         raw_scores[s] = max(0.0, raw_scores[active_slug] - 0.25)
             else:
-                mode_tag = "Neural-Top3"
-                neural_cands = [s for s, _p in neural_pred.top_slugs[:3] if s in self.dungeons]
+                mode_tag = "Neural-Top2"
+                neural_cands = [s for s, _p in neural_pred.top_slugs[:2] if s in self.dungeons]
                 if active_slug in self.dungeons and active_slug not in neural_cands:
                     neural_cands.append(active_slug)
                 for s in neural_cands:
@@ -1134,23 +1146,26 @@ class MinimapTracker:
                         gap_x = max(0.0, max(b_act[0] - b_cnd[2], b_cnd[0] - b_act[2]))
                         gap_y = max(0.0, max(b_act[1] - b_cnd[3], b_cnd[1] - b_act[3]))
                         if max(gap_x, gap_y) > 450.0:
+                            # Non-adjacent outdoor jump without a loading screen (e.g. STV -> EPL):
+                            # require high neural certainty (>= 0.85) AND >= 0.9s sustained confirmation
                             nn_confirms = (
                                 neural_pred is not None
                                 and neural_pred.best_slug == best_slug
-                                and neural_pred.best_prob >= 0.72
+                                and neural_pred.best_prob >= 0.85
                             )
                             if not nn_confirms:
                                 hold_non_adjacent = True
 
-                # Guard 2: Weak-match & multi-frame switch hysteresis (prevents 1-frame zone ping-pong).
+                # Guard 2: Weak-match & time-aware switch hysteresis (works identically at 1 Hz and 60 Hz!).
                 hold_switch = False
                 if not hold_outdoor_tunnel and not hold_non_adjacent and best_slug != active_slug and self._smooth_px is not None and active_slug in self.dungeons:
                     if best_raw < 0.42:
                         hold_switch = True
                     else:
-                        # Switching outdoor -> instanced dungeon without a loading screen needs 3 consecutive frames
-                        need_frames = 3 if (active_is_outdoor and not cand_is_outdoor and not recent_loading) else 2
-                        # Unmistakable outdoor-to-outdoor or post-loading-screen lock can switch faster
+                        entering_dungeon_no_load = (active_is_outdoor and not cand_is_outdoor and not recent_loading)
+                        need_frames = 3 if entering_dungeon_no_load else 2
+                        need_sec = 0.9 if entering_dungeon_no_load else 0.35
+                        # Unmistakable adjacent outdoor-to-outdoor or post-loading-screen lock can switch immediately
                         unmistakable = (
                             recent_loading
                             or (cand_is_outdoor and best_raw >= 0.72 and best_raw >= active_raw + 0.20)
@@ -1161,7 +1176,9 @@ class MinimapTracker:
                             else:
                                 self._switch_cand_slug = best_slug
                                 self._switch_confirm_count = 1
-                            if self._switch_confirm_count < need_frames:
+                                self._switch_cand_since_t = now_t
+                            held_sec = now_t - self._switch_cand_since_t
+                            if self._switch_confirm_count < need_frames or held_sec < need_sec:
                                 hold_switch = True
 
                 if hold_outdoor_tunnel or hold_non_adjacent or hold_switch:

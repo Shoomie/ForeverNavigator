@@ -356,6 +356,8 @@ class GPUMapViewport(QOpenGLWidget):
         while len(evictable) > limit:
             ek = evictable.pop(0)
             old = self._textures.pop(ek, None)
+            if ek.startswith("zone_"):
+                self.win._fullres_uploaded_zones.discard(ek[5:])
             if old is not None:
                 try:
                     old[0].release()
@@ -2766,6 +2768,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
 def run_qt_app(index_dir: str | Path = "data/index", fps: Optional[float] = None) -> int:
     """Launch the GPU-accelerated PySide6 + ModernGL ForeverNavigator application."""
+    from ..navigator.startup_cleanup import run_startup_cleanup
+
+    run_startup_cleanup(Path(index_dir).parent)
+
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
