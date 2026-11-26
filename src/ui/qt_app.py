@@ -724,33 +724,17 @@ class GPUMapViewport(QOpenGLWidget):
             p.setPen(QPen(QColor("#fc8181") if not alive else col))
             p.drawText(QPointF(sx + 9, sy + 3), label)
 
-        # Local player marker (360° directional WoW chevron when neural heading is available, else dot)
+        # Local player marker (clean dot using sub-pixel smoothed coordinates)
         est = self.win._latest_est
         if est is not None and not self.win.replay_mode and self.win.identity.player_id not in shown:
-            sx, sy = m2c(est.map_px[0], est.map_px[1])
-            hdg = getattr(self.win.tracker_mm, "last_heading_deg", None)
-            if hdg is not None:
-                import math
-                rad = math.radians(float(hdg))
-                ca, sa = math.cos(rad), math.sin(rad)
-                sz = 11.0
-                pts_local = [(0.0, -sz), (sz * 0.68, sz * 0.72), (0.0, sz * 0.28), (-sz * 0.68, sz * 0.72)]
-                path = QPainterPath()
-                for idx_pt, (lx, ly) in enumerate(pts_local):
-                    rx = lx * ca - ly * sa + sx
-                    ry = lx * sa + ly * ca + sy
-                    if idx_pt == 0:
-                        path.moveTo(rx, ry)
-                    else:
-                        path.lineTo(rx, ry)
-                path.closeSubpath()
-                p.setBrush(QBrush(QColor("#f5d742")))
-                p.setPen(QPen(QColor("#14161c"), 2.0))
-                p.drawPath(path)
+            rpx = getattr(self.win, "_render_px", None)
+            if rpx is not None:
+                sx, sy = m2c(rpx[0], rpx[1])
             else:
-                p.setBrush(QBrush(QColor("#ff5a46")))
-                p.setPen(QPen(QColor("#ffffff"), 2.0))
-                p.drawEllipse(QPointF(sx, sy), 7.0, 7.0)
+                sx, sy = m2c(est.map_px[0], est.map_px[1])
+            p.setBrush(QBrush(QColor("#ff5a46")))
+            p.setPen(QPen(QColor("#ffffff"), 2.0))
+            p.drawEllipse(QPointF(sx, sy), 7.0, 7.0)
 
     # --- Mouse & Wheel Forwarding ---
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -2186,7 +2170,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
             if self._showing_azeroth_overview:
                 self.lbl_dungeon.setText("Azeroth Overview — Searching for Position Fix...")
             threading.Thread(target=self._capture_loop, daemon=True, name="QtCaptureLoop").start()
-            self._poll_timer.start(max(16, int(round(1000.0 / max(1.0, self.fps)))))
+            self._poll_timer.start(16)  # 60 FPS visual interpolation timer (skips repaint when stationary)
 
     def _capture_loop(self) -> None:
         last_fs_grab_t = 0.0
@@ -2240,34 +2224,61 @@ class ForeverNavigatorQtWindow(QMainWindow):
             cap.close()
 
     def _poll_tracker(self) -> None:
-        if not self.running or self._closing:
+        if not self.running or self._closing or self.replay_mode:
             return
         with self._lock:
             est = self._latest_est
-        if est is None or est is self._last_rendered_est or self.replay_mode:
+        if est is None:
             return
-        self._last_rendered_est = est
-        self.pill_pos.setText(f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%")
-        now_fps = time.perf_counter()
-        prev_fps_t = getattr(self, "_last_est_wall_t", None)
-        self._last_est_wall_t = now_fps
-        if prev_fps_t is not None and (now_fps - prev_fps_t) > 1e-4:
-            inst_hz = 1.0 / (now_fps - prev_fps_t)
-            ema = getattr(self, "_measured_hz", inst_hz)
-            self._measured_hz = 0.25 * inst_hz + 0.75 * ema
-            self.pill_fps.setText(f"{self._measured_hz:.1f} / {self.fps:.0f} Hz")
-        if self._showing_azeroth_overview and self._transition_state is None:
-            self._maybe_autoload_neural_zone()
-            if self._is_good_position_fix(est):
-                self._start_fix_transition(est)
-        elif self._transition_state is None:
-            if self.chk_follow.isChecked():
-                self.pan_x, self.pan_y = float(est.map_px[0]), float(est.map_px[1])
-            self._maybe_autoload_neural_zone()
-            self._maybe_stream_nearby_zones(est)
+        is_new_est = (est is not self._last_rendered_est)
+        if is_new_est:
+            self._last_rendered_est = est
+            self.pill_pos.setText(f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%")
+            now_fps = time.perf_counter()
+            prev_fps_t = getattr(self, "_last_est_wall_t", None)
+            self._last_est_wall_t = now_fps
+            if prev_fps_t is not None and (now_fps - prev_fps_t) > 1e-4:
+                inst_hz = 1.0 / (now_fps - prev_fps_t)
+                ema = getattr(self, "_measured_hz", inst_hz)
+                self._measured_hz = 0.25 * inst_hz + 0.75 * ema
+                self.pill_fps.setText(f"{self._measured_hz:.1f} / {self.fps:.0f} Hz")
             self.lbl_dungeon.setText(f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]")
+
+        # Sub-pixel 60 FPS visual interpolation toward the latest tracker position (eliminates visual judder!)
+        target_px = getattr(self.tracker_mm, "last_smooth_px", None) or (float(est.map_px[0]), float(est.map_px[1]))
+        prev_slug = getattr(self, "_render_px_slug", None)
+        cur_rpx = getattr(self, "_render_px", None)
+        moved_vis = False
+        if cur_rpx is None or prev_slug != est.dungeon_slug:
+            self._render_px = (float(target_px[0]), float(target_px[1]))
+            self._render_px_slug = est.dungeon_slug
+            moved_vis = True
+        else:
+            dx = float(target_px[0]) - cur_rpx[0]
+            dy = float(target_px[1]) - cur_rpx[1]
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist > 45.0:
+                self._render_px = (float(target_px[0]), float(target_px[1]))
+                moved_vis = True
+            elif dist > 0.04:
+                alpha = 0.35
+                self._render_px = (cur_rpx[0] + dx * alpha, cur_rpx[1] + dy * alpha)
+                moved_vis = True
+
+        if self._showing_azeroth_overview and self._transition_state is None:
+            if is_new_est:
+                self._maybe_autoload_neural_zone()
+                if self._is_good_position_fix(est):
+                    self._start_fix_transition(est)
+        elif self._transition_state is None and (is_new_est or moved_vis):
+            if self.chk_follow.isChecked() and self._render_px is not None:
+                self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
+            if is_new_est:
+                self._maybe_autoload_neural_zone()
+                self._maybe_stream_nearby_zones(est)
             if self.view_3d_mode:
-                self._render_3d_frame()
+                if is_new_est:
+                    self._render_3d_frame()
             else:
                 self.viewport.update()
 

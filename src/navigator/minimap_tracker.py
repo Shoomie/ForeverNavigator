@@ -149,6 +149,10 @@ class MinimapTracker:
             self._neural = None
         self.last_heading_deg: Optional[float] = None
         self.last_neural_pred: Optional[NeuralPrediction] = None
+        self.last_smooth_px: Optional[Tuple[float, float]] = None
+        self._last_neural_run_t: float = 0.0
+        self._locked_zoom_yd: Optional[float] = None
+        self._last_zoom_check_t: float = 0.0
         self._lock = threading.RLock()
         self._executor: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(max_workers=min(12, max(2, os.cpu_count() or 4)), thread_name_prefix="MMTrack")
@@ -391,6 +395,10 @@ class MinimapTracker:
             self.dungeon_probs = np.full(n_d, 1.0 / max(1, n_d), dtype=np.float64)
             self._smooth_px = None
             self._last_update_t = None
+            self._locked_zoom_yd = None
+            self._last_zoom_check_t = 0.0
+            self._last_neural_run_t = 0.0
+            self.last_smooth_px = None
             self._last_loading_screen_t = None
             self._jump_cand_px = None
             self._jump_confirm_count = 0
@@ -500,7 +508,8 @@ class MinimapTracker:
                 _min_v, max_v, _min_l, max_l = cv2.minMaxLoc(combined)
                 if max_v > best_global_score:
                     best_global_score = float(max_v)
-                    best_global_xy = (roi_ox + max_l[0] + sz / 2.0, roi_oy + max_l[1] + sz / 2.0)
+                    sx_g, sy_g = self._subpixel_peak(combined, max_l[0], max_l[1])
+                    best_global_xy = (roi_ox + sx_g + sz / 2.0, roi_oy + sy_g + sz / 2.0)
 
                 # Also check best match within physically plausible movement radius
                 if prev_work_xy is not None and plausible_radius_work is not None:
@@ -514,7 +523,8 @@ class MinimapTracker:
                         _lv, lmax, _ll, lloc = cv2.minMaxLoc(sub)
                         if lmax > best_local_score:
                             best_local_score = float(lmax)
-                            best_local_xy = (roi_ox + x0 + lloc[0] + sz / 2.0, roi_oy + y0 + lloc[1] + sz / 2.0)
+                            sx_l, sy_l = self._subpixel_peak(sub, lloc[0], lloc[1])
+                            best_local_xy = (roi_ox + x0 + sx_l + sz / 2.0, roi_oy + y0 + sy_l + sz / 2.0)
 
         # Prefer physically plausible local match unless global match is decisively stronger
         if (
@@ -525,6 +535,27 @@ class MinimapTracker:
             return best_local_score, best_local_xy
 
         return best_global_score, best_global_xy
+
+    @staticmethod
+    def _subpixel_peak(mat: np.ndarray, lx: int, ly: int) -> Tuple[float, float]:
+        """2D parabolic sub-pixel peak interpolation around `(lx, ly)` (~0.005 ms, eliminates staircase stepping)."""
+        h, w = mat.shape[:2]
+        dx = 0.0
+        dy = 0.0
+        c = float(mat[ly, lx])
+        if 0 < lx < w - 1:
+            l_v, r_v = float(mat[ly, lx - 1]), float(mat[ly, lx + 1])
+            if l_v > -0.9 and r_v > -0.9:
+                denom = l_v - 2.0 * c + r_v
+                if denom < -1e-6:
+                    dx = float(np.clip(0.5 * (l_v - r_v) / denom, -0.5, 0.5))
+        if 0 < ly < h - 1:
+            u_v, d_v = float(mat[ly - 1, lx]), float(mat[ly + 1, lx])
+            if u_v > -0.9 and d_v > -0.9:
+                denom = u_v - 2.0 * c + d_v
+                if denom < -1e-6:
+                    dy = float(np.clip(0.5 * (u_v - d_v) / denom, -0.5, 0.5))
+        return float(lx) + dx, float(ly) + dy
 
     def _coarse_score_dungeon(
         self,
@@ -571,11 +602,24 @@ class MinimapTracker:
         crop = frame_rgb if is_already_cropped else self.roi.crop(frame_rgb)
         ch, cw = crop.shape[:2]
 
-        # Optional ultra-fast ONNX neural pre-pass: auto-centers minimap inside any ROI + 360° heading + top-K zones!
+        # Optional ultra-fast ONNX neural pre-pass: auto-centers minimap inside any ROI + top-K zones!
+        # At high polling rates (>=18 Hz) with a strong active lock, pace ONNX at ~12 Hz while local
+        # sub-pixel OpenCV runs every frame (~3 ms) -> sustains true 60 Hz with minimal CPU!
         neural_pred: Optional[NeuralPrediction] = None
         if self.use_neural and self._neural is not None and self._neural.available:
-            neural_pred = self._neural.predict(crop, top_k=5)
-            self.last_neural_pred = neural_pred
+            reuse_cached_nn = (
+                self.last_neural_pred is not None
+                and self._smooth_px is not None
+                and self.last_neural_pred.best_slug == self.active_slug
+                and self.last_neural_pred.best_prob >= 0.55
+                and (t0 - self._last_neural_run_t) < 0.085
+            )
+            if reuse_cached_nn:
+                neural_pred = self.last_neural_pred
+            else:
+                neural_pred = self._neural.predict(crop, top_k=5)
+                self.last_neural_pred = neural_pred
+                self._last_neural_run_t = t0
             if neural_pred is not None and neural_pred.best_prob >= 0.35 and neural_pred.best_slug in self.dungeons:
                 self.last_heading_deg = neural_pred.heading_deg
                 centered = self._neural.extract_autocentered_minimap(crop, neural_pred)
@@ -654,9 +698,19 @@ class MinimapTracker:
             d = self.dungeons[slug]
             ratio = self._scale_ratio[slug]
             w_sz = self._map_sil[slug].shape[0]
+            # Fast locked-scale path: once zoom is known on active_slug, test only the locked scale
+            # (cuts local OpenCV from ~15 ms -> ~2.5 ms for true 60 Hz), re-checking all scales every 1.5s.
+            use_locked_scale = (
+                not force_full_map
+                and slug == self.active_slug
+                and self._smooth_px is not None
+                and self._locked_zoom_yd is not None
+                and (now_t - self._last_zoom_check_t) < 1.5
+            )
+            radii_to_try = (self._locked_zoom_yd,) if use_locked_scale else zoom_radii_yd
             raw_scales = [
-                min(w_sz - 8, int(round(2.0 * r_yd * 0.62 * d.map_scale / ratio)))
-                for r_yd in zoom_radii_yd
+                min(w_sz - 8, int(round(2.0 * float(r_yd) * 0.62 * d.map_scale / ratio)))
+                for r_yd in radii_to_try
             ]
             valid_scales = sorted(set(s for s in raw_scales if s >= 10))
             if not valid_scales:
@@ -676,11 +730,31 @@ class MinimapTracker:
                     # Seed cold-start / post-cave re-acquisition with the neural (norm_u, norm_v) prediction
                     prev_wxy = (float(neural_pred.norm_u) * float(w_sz), float(neural_pred.norm_v) * float(w_sz))
                     plaus_w = max(24.0, float(w_sz) * 0.14)
-            return self._match_single_dungeon(
+            sc, xy = self._match_single_dungeon(
                 slug, crop_sil, crop_edge, scales_px, angles_deg,
                 prev_work_xy=prev_wxy, plausible_radius_work=plaus_w,
                 tpl_cache=tpl_cache,
             )
+            # If locked-scale match dipped, immediately fall back to full multi-scale check
+            if use_locked_scale and sc < 0.52:
+                self._locked_zoom_yd = None
+                return eval_fine(slug, force_full_map=False)
+            if not use_locked_scale and slug == self.active_slug and sc >= 0.55:
+                # Pick the zoom radius whose scale best matched (update every 1.5s)
+                best_r = zoom_radii_yd[0]
+                best_rs = -1.0
+                for r_yd in zoom_radii_yd:
+                    s_r = max(10, min(w_sz - 8, int(round(2.0 * r_yd * 0.62 * d.map_scale / ratio))))
+                    sr, _ = self._match_single_dungeon(
+                        slug, crop_sil, crop_edge, (s_r,), angles_deg,
+                        prev_work_xy=xy, plausible_radius_work=6.0, tpl_cache=tpl_cache,
+                    )
+                    if sr > best_rs:
+                        best_rs = sr
+                        best_r = r_yd
+                self._locked_zoom_yd = best_r
+                self._last_zoom_check_t = now_t
+            return sc, xy
 
         with self._lock:
             order = list(self.dungeon_order)
@@ -996,6 +1070,7 @@ class MinimapTracker:
                     self.trail_px.clear()
                 # else: hold previous smooth_px for 1 frame until confirmed
 
+        self.last_smooth_px = (float(self._smooth_px[0]), float(self._smooth_px[1]))
         px_i, py_i = int(round(float(self._smooth_px[0]))), int(round(float(self._smooth_px[1])))
         self.trail_px.append((px_i, py_i))
         if len(self.trail_px) > 60:

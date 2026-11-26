@@ -231,11 +231,16 @@ class NeuralMinimapLocalizer:
 
     @staticmethod
     def extract_autocentered_minimap(crop_rgb: np.ndarray, pred: NeuralPrediction) -> np.ndarray:
-        """Extract a square centered exactly on the predicted minimap center `(mm_cx, mm_cy)` and radius `mm_r`."""
+        """Extract a square centered on the predicted minimap center `(mm_cx, mm_cy)` and inner terrain radius.
+
+        When the user's ROI includes the circular minimap frame (`mm_r < 0.46`), trims the outer ~12%
+        bezel ring so template matching sees pure minimap terrain just like an inner-only ROI.
+        """
         h, w = crop_rgb.shape[:2]
         cx = int(round(pred.mm_cx * w))
         cy = int(round(pred.mm_cy * h))
-        r = max(12, int(round(pred.mm_r * min(w, h))))
+        r_frac = pred.mm_r * 0.88 if pred.mm_r < 0.46 else pred.mm_r
+        r = max(12, int(round(r_frac * min(w, h))))
         x0 = max(0, cx - r)
         y0 = max(0, cy - r)
         x1 = min(w, cx + r)
