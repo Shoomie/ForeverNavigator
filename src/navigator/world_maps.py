@@ -352,8 +352,13 @@ class FullResTileSource:
         sc_ov: float,
         cw: int,
         ch: int,
-    ) -> Image.Image:
-        """Render a (cw, ch) viewport centered at overview pixel (pan_x_ov, pan_y_ov) at scale sc_ov."""
+        max_tiles_per_frame: int = 20,
+    ) -> Optional[Image.Image]:
+        """Render a (cw, ch) viewport centered at overview pixel (pan_x_ov, pan_y_ov) at scale sc_ov.
+
+        Returns None if the visible region spans more than `max_tiles_per_frame` tiles so zoomed-out
+        views never thrash SSD/CASC I/O.
+        """
         ov_to_nat = self.native_span_px / max(1.0, float(self.overview_px))
         sc_nat = sc_ov / max(1e-6, ov_to_nat)
         pan_x_nat = pan_x_ov * ov_to_nat
@@ -378,11 +383,18 @@ class FullResTileSource:
         ty_min = max(0, int(np.floor(32.0 - wx_hi / ADT_YARD_SIZE)))
         ty_max = min(63, int(np.floor(32.0 - wx_lo / ADT_YARD_SIZE)))
 
+        # Hard I/O cap: count how many actual tiles overlap the viewport before decoding anything
+        vis_tiles = [
+            (tx, ty)
+            for ty in range(ty_min, ty_max + 1)
+            for tx in range(tx_min, tx_max + 1)
+            if (tx, ty) in self.tile_lookup
+        ]
+        if len(vis_tiles) > max_tiles_per_frame:
+            return None
+
         out = Image.new("RGB", (cw, ch), self.bg_color)
-        for ty in range(ty_min, ty_max + 1):
-            for tx in range(tx_min, tx_max + 1):
-                if (tx, ty) not in self.tile_lookup:
-                    continue
+        for tx, ty in vis_tiles:
                 wy_left = (32 - tx) * ADT_YARD_SIZE
                 wx_top = (32 - ty) * ADT_YARD_SIZE
                 tile_nx0 = (h_nat - 1.0) - (wy_left - self.wy0) * self.native_scale
@@ -557,8 +569,9 @@ class WorldMapRegistry:
                 keywords=(name.lower(),),
             )
 
-        # 3. Dynamic discovery from wowf UiMap.db2 & full minimap tile index if CASC is available
-        if self.wow_dir is not None:
+        # 3. Prefer cached v2 minimap index (zero CASC SSD reads on startup); only scan CASC on first run
+        has_cached_idx = self._load_cached_minimap_index()
+        if not has_cached_idx and self.wow_dir is not None:
             try:
                 with LocalCASC(self.wow_dir, product="wowf") as casc:
                     for uid, name, parent, bounds in _parse_uimap_db2(casc):
@@ -582,10 +595,6 @@ class WorldMapRegistry:
                     self._ensure_minimap_tile_index(casc)
             except Exception:
                 pass
-
-        else:
-            # Even without wow_dir, load cached v2 minimap index if present
-            self._load_cached_minimap_index()
 
         # 4. Register every remaining terrain/instance minimap folder (all 715+ folders)
         known_folders_lower = {
@@ -820,6 +829,24 @@ class WorldMapRegistry:
     def has_full_res_tiles(self, slug: str) -> bool:
         return slug in self._fullres_sources
 
+    def ensure_full_res_tiles(self, slug: str) -> bool:
+        """Lazily attach a FullResTileSource for a large continent/map only when deep-zoomed."""
+        if slug in self._fullres_sources:
+            return True
+        if self.wow_dir is None:
+            return False
+        entry = self._entries.get(slug)
+        if entry is None:
+            return False
+        d = self._loaded_dungeons.get(slug)
+        if d is None:
+            try:
+                d = self.load_map(slug, preview_only=True, max_preview_px=512)
+            except Exception:
+                return False
+        self._attach_fullres_source_for_entry(entry, d)
+        return slug in self._fullres_sources
+
     def set_storage_mode(self, mode: str) -> None:
         """Configure tile cache budgets for 'ssd' (low RAM, dynamic streaming) vs 'hdd' (larger cache)."""
         m = "hdd" if str(mode).lower() == "hdd" else "ssd"
@@ -878,10 +905,25 @@ class WorldMapRegistry:
                 self._loaded_dungeons[slug] = d
             return d
 
-        # 2. Check stitched cache data/cache/maps/<slug>.npz
+        # 2. Check stitched cache data/cache/maps/<slug>.npz (with fast tiny preview sidecar for preview_only)
         cache_npz = self.cache_dir / f"{slug}.npz"
         entry = self._entries.get(slug)
         if cache_npz.exists():
+            if preview_only:
+                sidecar = self.cache_dir / f"{slug}_prev{max_preview_px}.npz"
+                if sidecar.exists() and sidecar.stat().st_mtime >= cache_npz.stat().st_mtime:
+                    try:
+                        d_sc = load_dungeon_npz(sidecar)
+                        png_sib = cache_npz.with_suffix(".png")
+                        d_sc.map_full_path = png_sib if png_sib.exists() else cache_npz
+                        if d_sc.bounds_xy is None and entry is not None and entry.bounds_xy is not None:
+                            d_sc.bounds_xy = entry.bounds_xy
+                        with self._lock:
+                            self._loaded_dungeons[slug] = d_sc
+                        return d_sc
+                    except Exception:
+                        pass
+
             is_full_res_cache = False
             native_px_cache = 0
             try:
@@ -896,7 +938,9 @@ class WorldMapRegistry:
                 d.bounds_xy = entry.bounds_xy
             # Upgrade older low-res cached maps when local CASC is available
             if is_full_res_cache or self.wow_dir is None or entry is None:
-                if entry is not None and native_px_cache > MAX_IN_MEMORY_MAP_PX and self.wow_dir is not None:
+                if preview_only and d.map_image.shape[0] < d.map_size_px:
+                    self._save_preview_sidecar(d, self.cache_dir / f"{slug}_prev{max_preview_px}.npz")
+                if not preview_only and entry is not None and native_px_cache > MAX_IN_MEMORY_MAP_PX and self.wow_dir is not None:
                     self._attach_fullres_source_for_entry(entry, d)
                 with self._lock:
                     self._loaded_dungeons[slug] = d
@@ -1423,6 +1467,29 @@ class WorldMapRegistry:
             bounds_xy=entry.bounds_xy,
         )
 
+    @staticmethod
+    def _save_preview_sidecar(d: DungeonData, sidecar_path: Path) -> None:
+        """Save a tiny ~120 KB preview .npz so subsequent startups skip reading 40 MB zone files."""
+        try:
+            extra = {}
+            if d.bounds_xy is not None:
+                extra["bounds_xy"] = np.array(d.bounds_xy, dtype=np.float32)
+            np.savez_compressed(
+                sidecar_path,
+                slug=d.slug,
+                name=d.name,
+                combatlog_keywords=np.array(d.combatlog_keywords, dtype=str),
+                waypoints=d.waypoints,
+                map_image=d.map_image,
+                map_origin_xy=d.map_origin_xy,
+                map_scale=np.float32(d.map_scale),
+                map_rot90=np.int32(d.map_rot90),
+                native_map_px=np.int32(d.map_size_px),
+                **extra,
+            )
+        except Exception:
+            pass
+
     def _save_to_cache(self, d: DungeonData, full_res: bool = True, native_px: int = 0) -> None:
         try:
             png_path = self.cache_dir / f"{d.slug}.png"
@@ -1569,32 +1636,72 @@ def _build_forever_playable_mask(
     return mask
 
 
+_AZEROTH_OVERVIEW_CACHE_VERSION = 1
+
+
 def build_azeroth_overview(
     registry: Optional[WorldMapRegistry],
-    width: int = 1600,
-    height: int = 900,
+    width: int = 3840,
+    height: int = 2160,
+    use_disk_cache: bool = True,
 ) -> AzerothOverview:
-    """Compose a lightweight Kalimdor + Eastern Kingdoms world overview (~4 MB RAM)."""
+    """Load or build a precached, prestitched 4K Kalimdor + Eastern Kingdoms world overview.
+
+    When cached on disk (`azeroth_overview_4k.jpg` + `.json`), loads in ~40 ms with zero CASC I/O.
+    """
+    cache_img_path: Optional[Path] = None
+    cache_meta_path: Optional[Path] = None
+    if use_disk_cache and registry is not None:
+        cache_img_path = registry.cache_dir / f"azeroth_overview_{width}x{height}.jpg"
+        cache_meta_path = registry.cache_dir / f"azeroth_overview_{width}x{height}.json"
+        if cache_img_path.exists() and cache_meta_path.exists():
+            try:
+                meta = json.loads(cache_meta_path.read_text(encoding="utf-8"))
+                if (
+                    meta.get("version") == _AZEROTH_OVERVIEW_CACHE_VERSION
+                    and int(meta.get("width", 0)) == width
+                    and int(meta.get("height", 0)) == height
+                ):
+                    with Image.open(cache_img_path) as raw_im:
+                        im = raw_im.convert("RGB")
+                    placements: Dict[str, _ContinentPlacement] = {}
+                    for folder, pd in meta.get("placements", {}).items():
+                        placements[folder] = _ContinentPlacement(
+                            map_origin_xy=(float(pd["map_origin_xy"][0]), float(pd["map_origin_xy"][1])),
+                            map_scale=float(pd["map_scale"]),
+                            map_size_px=int(pd["map_size_px"]),
+                            map_rot90=int(pd["map_rot90"]),
+                            preview_px=int(pd["preview_px"]),
+                            src_box=tuple(int(v) for v in pd["src_box"]),
+                            dst_box=tuple(int(v) for v in pd["dst_box"]),
+                        )
+                    return AzerothOverview(image=im, placements=placements)
+            except Exception:
+                pass
+
     ocean = (18, 36, 58)
     canvas = np.full((height, width, 3), ocean, dtype=np.uint8)
 
     # Subtle nautical latitude/longitude grid
-    for gx in range(160, width, 160):
+    grid_x = max(160, width // 10)
+    grid_y = max(150, height // 6)
+    for gx in range(grid_x, width, grid_x):
         cv2.line(canvas, (gx, 0), (gx, height - 1), (24, 45, 70), 1)
-    for gy in range(150, height, 150):
+    for gy in range(grid_y, height, grid_y):
         cv2.line(canvas, (0, gy), (width - 1, gy), (24, 45, 70), 1)
 
-    placements: Dict[str, _ContinentPlacement] = {}
+    placements = {}
     specs = [
         ("Kalimdor", "kalimdor", (int(width * 0.03), int(height * 0.07), int(width * 0.47), int(height * 0.96))),
         ("Azeroth", "eastern_kingdoms", (int(width * 0.53), int(height * 0.07), int(width * 0.97), int(height * 0.96))),
     ]
 
+    src_preview_px = min(2048, max(1024, height))
     for folder, slug, (slot_x0, slot_y0, slot_x1, slot_y1) in specs:
         if registry is None:
             continue
         try:
-            cont_d = registry.load_map(slug, preview_only=True, max_preview_px=1024)
+            cont_d = registry.load_map(slug, preview_only=True, max_preview_px=src_preview_px)
         except Exception:
             continue
         arr = cont_d.map_image
@@ -1631,7 +1738,8 @@ def build_azeroth_overview(
 
         resized = cv2.resize(crop, (dw, dh), interpolation=cv2.INTER_AREA)
         mask_f = cv2.resize(crop_land.astype(np.float32), (dw, dh), interpolation=cv2.INTER_LINEAR)
-        mask_f = cv2.GaussianBlur(mask_f, (9, 9), 2.5)
+        ksize = 15 if width >= 2560 else 9
+        mask_f = cv2.GaussianBlur(mask_f, (ksize, ksize), 3.0)
         alpha = np.clip(mask_f * 1.35, 0.0, 1.0)[:, :, None]
         roi_dst = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
         blended = resized.astype(np.float32) * alpha + roi_dst * (1.0 - alpha)
@@ -1647,20 +1755,49 @@ def build_azeroth_overview(
             dst_box=(dx0, dy0, dx1, dy1),
         )
 
-    # Clean continent titles
+    # Clean continent titles scaled proportionally to canvas width
     font = cv2.FONT_HERSHEY_SIMPLEX
+    f_scale = 0.65 * (width / 1600.0)
+    f_thick = max(2, int(round(2 * (width / 1600.0))))
     for text, cx_f, cy_f, col in (
-        ("KALIMDOR", 0.255, 0.045, (235, 200, 115)),
-        ("EASTERN KINGDOMS", 0.745, 0.045, (235, 200, 115)),
+        ("KALIMDOR", 0.25, 0.045, (235, 200, 115)),
+        ("EASTERN KINGDOMS", 0.75, 0.045, (235, 200, 115)),
         ("THE GREAT SEA", 0.50, 0.52, (95, 138, 178)),
     ):
-        (tw, _th), _ = cv2.getTextSize(text, font, 0.65, 2)
+        (tw, _th), _ = cv2.getTextSize(text, font, f_scale, f_thick)
         tx = int(width * cx_f - tw * 0.5)
         ty = int(height * cy_f)
-        cv2.putText(canvas, text, (tx + 1, ty + 1), font, 0.65, (10, 18, 28), 2, cv2.LINE_AA)
-        cv2.putText(canvas, text, (tx, ty), font, 0.65, col, 2, cv2.LINE_AA)
+        cv2.putText(canvas, text, (tx + 2, ty + 2), font, f_scale, (10, 18, 28), f_thick, cv2.LINE_AA)
+        cv2.putText(canvas, text, (tx, ty), font, f_scale, col, f_thick, cv2.LINE_AA)
 
-    return AzerothOverview(image=Image.fromarray(canvas, mode="RGB"), placements=placements)
+    pil_im = Image.fromarray(canvas, mode="RGB")
+
+    # Save precached prestitched overview to disk for instant future launches
+    if cache_img_path is not None and cache_meta_path is not None and placements:
+        try:
+            pil_im.save(cache_img_path, format="JPEG", quality=90, optimize=True)
+            meta_out = {
+                "version": _AZEROTH_OVERVIEW_CACHE_VERSION,
+                "width": width,
+                "height": height,
+                "placements": {
+                    f: {
+                        "map_origin_xy": list(p.map_origin_xy),
+                        "map_scale": p.map_scale,
+                        "map_size_px": p.map_size_px,
+                        "map_rot90": p.map_rot90,
+                        "preview_px": p.preview_px,
+                        "src_box": list(p.src_box),
+                        "dst_box": list(p.dst_box),
+                    }
+                    for f, p in placements.items()
+                },
+            }
+            cache_meta_path.write_text(json.dumps(meta_out), encoding="utf-8")
+        except Exception:
+            pass
+
+    return AzerothOverview(image=pil_im, placements=placements)
 
 
 # ---------------------------------------------------------------------------

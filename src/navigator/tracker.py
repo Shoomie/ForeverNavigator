@@ -189,10 +189,10 @@ def load_dungeon_npz(npz_path: Path, max_preview_px: Optional[int] = None) -> Du
                 b_xy = (float(arr_b[0]), float(arr_b[1]), float(arr_b[2]), float(arr_b[3]))
 
         map_img = z["map_image"].astype(np.uint8)
-        native_px = int(map_img.shape[0])
+        native_px = int(z["native_map_px"]) if "native_map_px" in z else int(map_img.shape[0])
         png_sibling = npz_path.with_suffix(".png")
         full_path = png_sibling if png_sibling.exists() else npz_path
-        if max_preview_px is not None and native_px > max_preview_px:
+        if max_preview_px is not None and map_img.shape[0] > max_preview_px:
             map_img = cv2.resize(map_img, (max_preview_px, max_preview_px), interpolation=cv2.INTER_AREA)
 
         return DungeonData(

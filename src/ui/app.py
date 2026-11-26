@@ -956,6 +956,7 @@ class ForeverNavigatorApp:
                 if ov is not None:
                     if self._azeroth_overview is not None:
                         self._azeroth_overview.close()
+                    self._cached_mips.pop("__azeroth_ov", None)
                     self._azeroth_overview = ov
                     self._overview_pan_x = ov.width * 0.5
                     self._overview_pan_y = ov.height * 0.5
@@ -1211,13 +1212,13 @@ class ForeverNavigatorApp:
         self._reset_view()
 
     def _load_azeroth_overview_async(self) -> None:
-        """Build the lightweight Kalimdor + Eastern Kingdoms world overview on a background thread."""
+        """Load the precached 4K Kalimdor + Eastern Kingdoms world overview on a background thread."""
 
         def _worker() -> None:
             try:
                 from ..navigator.world_maps import build_azeroth_overview
 
-                ov = build_azeroth_overview(self.world_maps, width=1600, height=900)
+                ov = build_azeroth_overview(self.world_maps, width=3840, height=2160, use_disk_cache=True)
                 if not self._closing:
                     self._ui_queue.put(("azeroth_overview_loaded", ov))
             except Exception:
@@ -1226,8 +1227,8 @@ class ForeverNavigatorApp:
         threading.Thread(target=_worker, daemon=True, name="BuildAzerothOverview").start()
 
     def _overview_eff_scale(self, cw: int, ch: int) -> float:
-        ov_w = float(self._azeroth_overview.width) if self._azeroth_overview is not None else 1600.0
-        ov_h = float(self._azeroth_overview.height) if self._azeroth_overview is not None else 900.0
+        ov_w = float(self._azeroth_overview.width) if self._azeroth_overview is not None else 3840.0
+        ov_h = float(self._azeroth_overview.height) if self._azeroth_overview is not None else 2160.0
         base_sc = min(max(64, cw) / ov_w, max(64, ch) / ov_h)
         return base_sc * self._overview_zoom
 
@@ -1502,7 +1503,7 @@ class ForeverNavigatorApp:
                 cur = cur.resize((nw, nh), Image.Resampling.BILINEAR)
                 div *= 2
                 mips.append((div, cur))
-            if not hasattr(self, "_cached_pil_maps") or key in self._cached_pil_maps:
+            if not hasattr(self, "_cached_pil_maps") or key in self._cached_pil_maps or key == "__azeroth_ov":
                 self._cached_mips[key] = mips
 
         chosen_div, chosen_im = mips[0]
@@ -1807,57 +1808,30 @@ class ForeverNavigatorApp:
         self._update_live_pills(est)
         self._refresh_roster(shown_players)
 
-        # Startup / pre-fix Azeroth Overview (Kalimdor + Eastern Kingdoms, viewport-capped with deep full-res zoom)
+        # Startup / pre-fix 4K Azeroth Overview (Kalimdor + Eastern Kingdoms, viewport-capped with deep full-res zoom)
         if self._showing_azeroth_overview and not self.view_3d_mode and not self.replay_mode:
             if self._azeroth_overview is not None:
                 sc_ov = self._overview_eff_scale(cw, ch)
                 ov_view = None
-                # When zoomed into a continent, stream viewport-capped high-res tiles / continent mip on demand
-                if sc_ov > 1.35:
+                # Only stream native 512px CASC tiles when deeply zoomed (sc_cont >= 1.20 -> <= ~12 visible tiles)
+                if not self._is_interacting and sc_ov > 1.15 and self.world_maps is not None:
                     mapped = self._azeroth_overview.overview_px_to_continent_px(
                         self._overview_pan_x, self._overview_pan_y
                     )
                     if mapped is not None:
-                        m_folder, m_cont_slug, cx_cont, cy_cont, cont_per_ov = mapped
+                        _m_folder, m_cont_slug, cx_cont, cy_cont, cont_per_ov = mapped
                         sc_cont = sc_ov / max(1e-6, cont_per_ov)
-                        # Tier 3: Full-res CASC tiles for the exact visible viewport when settled
-                        if (
-                            not self._is_interacting
-                            and self.world_maps is not None
-                            and self.world_maps.has_full_res_tiles(m_cont_slug)
-                        ):
+                        if sc_cont >= 1.20 and self.world_maps.ensure_full_res_tiles(m_cont_slug):
                             ov_view = self.world_maps.render_full_res_viewport(
                                 m_cont_slug, cx_cont, cy_cont, sc_cont, cw, ch
                             )
-                        # Tier 2: Crisp 1536px continent backdrop during drag/zoom or offline
-                        if ov_view is None:
-                            self._ensure_continent_backdrop(m_folder)
-                            cont_d = self._continent_maps.get(m_folder)
-                            if cont_d is not None:
-                                cont_pil = self._cached_pil_maps.get(f"__cont_{m_folder}")
-                                if cont_pil is None:
-                                    cont_pil = Image.fromarray(cont_d.map_image)
-                                    self._cached_pil_maps[f"__cont_{m_folder}"] = cont_pil
-                                cont_ratio = cont_pil.width / max(1.0, float(cont_d.map_size_px))
-                                cont_mip, c_div = self._get_mip_for_scale(
-                                    f"__cont_{m_folder}", cont_pil, sc_cont / max(1e-5, cont_ratio)
-                                )
-                                sc_c_mip = (sc_cont / max(1e-5, cont_ratio)) * c_div
-                                inv_sc = 1.0 / max(1e-5, sc_c_mip)
-                                tx_c = (cx_cont * cont_ratio / c_div) - (cw * 0.5) * inv_sc
-                                ty_c = (cy_cont * cont_ratio / c_div) - (ch * 0.5) * inv_sc
-                                ov_view = cont_mip.transform(
-                                    (cw, ch),
-                                    Image.Transform.AFFINE,
-                                    (inv_sc, 0.0, tx_c, 0.0, inv_sc, ty_c),
-                                    resample=Image.Resampling.BILINEAR,
-                                    fillcolor=(18, 36, 58),
-                                )
+                # Baseline 4K precached overview with mip pyramid (zero SSD reads during pan/zoom 1x..5x!)
                 if ov_view is None:
-                    inv_s = 1.0 / max(1e-5, sc_ov)
-                    tx = self._overview_pan_x - (cw * 0.5) * inv_s
-                    ty = self._overview_pan_y - (ch * 0.5) * inv_s
-                    ov_view = self._azeroth_overview.image.transform(
+                    ov_mip, ov_div = self._get_mip_for_scale("__azeroth_ov", self._azeroth_overview.image, sc_ov)
+                    inv_s = 1.0 / max(1e-5, sc_ov * ov_div)
+                    tx = (self._overview_pan_x / ov_div) - (cw * 0.5) * inv_s
+                    ty = (self._overview_pan_y / ov_div) - (ch * 0.5) * inv_s
+                    ov_view = ov_mip.transform(
                         (cw, ch),
                         Image.Transform.AFFINE,
                         (inv_s, 0.0, tx, 0.0, inv_s, ty),
