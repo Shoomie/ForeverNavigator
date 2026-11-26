@@ -490,6 +490,36 @@ class TestWorldMapsAndModernUI(unittest.TestCase):
         finally:
             app._on_close()
 
+    @unittest.skipUnless((INDEX_DIR / "manifest.json").exists(), "Index not present")
+    def test_qt_gpu_ui_instantiation_render_and_close(self):
+        try:
+            from PySide6.QtGui import QSurfaceFormat
+            from PySide6.QtWidgets import QApplication
+            from src.ui.qt_app import ForeverNavigatorQtWindow
+        except ImportError:
+            self.skipTest("PySide6 not installed")
+            return
+
+        fmt = QSurfaceFormat()
+        fmt.setVersion(3, 3)
+        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+        QSurfaceFormat.setDefaultFormat(fmt)
+
+        qt_app = QApplication.instance() or QApplication([])
+        win = ForeverNavigatorQtWindow(INDEX_DIR)
+        try:
+            win.show()
+            qt_app.processEvents()
+            win.viewport.repaint()
+            qt_app.processEvents()
+            self.assertIsNotNone(win.world_maps)
+            self.assertGreater(len(win._all_map_entries), 0)
+            self.assertTrue(win._can_edit_whiteboard())
+            self.assertTrue(win._showing_azeroth_overview)
+        finally:
+            win.close()
+            qt_app.processEvents()
+
     def test_dev_gameplay_logger_disabled_and_enabled(self):
         import json
         from types import SimpleNamespace
