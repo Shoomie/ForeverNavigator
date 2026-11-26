@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 
 from .gpu_matcher import GPUComputeMatcher
+from .neural_localizer import NeuralMinimapLocalizer, NeuralPrediction
 from .tracker import DungeonData, TrackerEstimate
 
 
@@ -121,6 +122,11 @@ class MinimapTracker:
         high_precision: bool = False,
         use_gpu: bool = True,
         lazy_precompute: bool = False,
+        neural_localizer: Optional[NeuralMinimapLocalizer] = None,
+        neural_model_name: Optional[str] = None,
+        use_neural: bool = True,
+        periodic_anchor: bool = True,
+        anchor_interval_sec: float = 2.5,
     ):
         self.dungeons = dungeons
         self.dungeon_order = dungeon_order
@@ -130,6 +136,19 @@ class MinimapTracker:
         self.high_precision = bool(high_precision)
         self.use_gpu = bool(use_gpu)
         self.lazy_precompute = bool(lazy_precompute)
+        self.use_neural = bool(use_neural)
+        self.periodic_anchor = bool(periodic_anchor)
+        self.anchor_interval_sec = max(0.5, float(anchor_interval_sec))
+        self._last_anchor_t: float = 0.0
+        self._neural: Optional[NeuralMinimapLocalizer] = (
+            neural_localizer
+            if neural_localizer is not None
+            else NeuralMinimapLocalizer(preferred_stem=neural_model_name or None)
+        )
+        if self._neural is not None and not self._neural.available:
+            self._neural = None
+        self.last_heading_deg: Optional[float] = None
+        self.last_neural_pred: Optional[NeuralPrediction] = None
         self._lock = threading.RLock()
         self._executor: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(max_workers=min(12, max(2, os.cpu_count() or 4)), thread_name_prefix="MMTrack")
@@ -176,6 +195,30 @@ class MinimapTracker:
         }
         self._last_outdoor_slug: Optional[str] = None
         self._last_outdoor_world_pos: Optional[np.ndarray] = None
+
+    def set_use_neural(self, enabled: bool) -> None:
+        """Toggle between Hybrid Neural ONNX + OpenCV and Classic Pure OpenCV tracking live."""
+        with self._lock:
+            self.use_neural = bool(enabled)
+            if not self.use_neural:
+                self.last_heading_deg = None
+                self.last_neural_pred = None
+
+    def set_periodic_anchor(self, enabled: bool) -> None:
+        """Toggle periodic full-map geometric OpenCV anchor stabilization (~every 2.5s)."""
+        with self._lock:
+            self.periodic_anchor = bool(enabled)
+
+    def set_neural_model(self, model_stem: str, models_dir: str | Path = "data/models") -> bool:
+        """Hot-swap the active ONNX neural localizer model live (thread-safe)."""
+        new_nn = NeuralMinimapLocalizer(models_dir=models_dir, preferred_stem=model_stem or None)
+        if not new_nn.available:
+            return False
+        with self._lock:
+            self._neural = new_nn
+            self.last_neural_pred = None
+            self.last_heading_deg = None
+        return True
 
     def mark_shared_map(self, slug: str, is_shared: bool = True) -> None:
         with self._lock:
@@ -376,8 +419,31 @@ class MinimapTracker:
         m_edge = self._map_edge[slug]
         mh, mw = m_sil.shape[:2]
 
+        # Fast local-ROI crop optimization: when already locked near prev_work_xy and local_only=True,
+        # crop m_sil / m_edge to a tight window around prev_work_xy (~1-3 ms vs ~90 ms full-map!).
+        roi_ox, roi_oy = 0, 0
+        if prev_work_xy is not None and plausible_radius_work is not None and plausible_radius_work < min(mh, mw) * 0.25:
+            max_sz = max(scales_px) if scales_px else 40
+            pad_roi = int(round(plausible_radius_work + max_sz * 0.65 + 8))
+            cx_i, cy_i = int(round(prev_work_xy[0])), int(round(prev_work_xy[1]))
+            rx0 = max(0, cx_i - pad_roi)
+            ry0 = max(0, cy_i - pad_roi)
+            rx1 = min(mw, cx_i + pad_roi)
+            ry1 = min(mh, cy_i + pad_roi)
+            if (rx1 - rx0) >= max_sz + 8 and (ry1 - ry0) >= max_sz + 8:
+                m_sil = m_sil[ry0:ry1, rx0:rx1]
+                m_edge = m_edge[ry0:ry1, rx0:rx1]
+                vc_src = self._valid_center[slug][ry0:ry1, rx0:rx1]
+                roi_ox, roi_oy = rx0, ry0
+                mh, mw = m_sil.shape[:2]
+                prev_work_xy = (prev_work_xy[0] - roi_ox, prev_work_xy[1] - roi_oy)
+            else:
+                vc_src = self._valid_center[slug]
+        else:
+            vc_src = self._valid_center[slug]
+
         best_global_score = -1.0
-        best_global_xy = (mw / 2.0, mh / 2.0)
+        best_global_xy = (roi_ox + mw / 2.0, roi_oy + mh / 2.0)
         best_local_score = -1.0
         best_local_xy = best_global_xy
 
@@ -428,13 +494,13 @@ class MinimapTracker:
 
                 half = sz // 2
                 rh, rw = combined.shape
-                vc = self._valid_center[slug][half : half + rh, half : half + rw]
+                vc = vc_src[half : half + rh, half : half + rw]
                 combined = np.where(vc, combined, -1.0)
 
                 _min_v, max_v, _min_l, max_l = cv2.minMaxLoc(combined)
                 if max_v > best_global_score:
                     best_global_score = float(max_v)
-                    best_global_xy = (max_l[0] + sz / 2.0, max_l[1] + sz / 2.0)
+                    best_global_xy = (roi_ox + max_l[0] + sz / 2.0, roi_oy + max_l[1] + sz / 2.0)
 
                 # Also check best match within physically plausible movement radius
                 if prev_work_xy is not None and plausible_radius_work is not None:
@@ -448,7 +514,7 @@ class MinimapTracker:
                         _lv, lmax, _ll, lloc = cv2.minMaxLoc(sub)
                         if lmax > best_local_score:
                             best_local_score = float(lmax)
-                            best_local_xy = (x0 + lloc[0] + sz / 2.0, y0 + lloc[1] + sz / 2.0)
+                            best_local_xy = (roi_ox + x0 + lloc[0] + sz / 2.0, roi_oy + y0 + lloc[1] + sz / 2.0)
 
         # Prefer physically plausible local match unless global match is decisively stronger
         if (
@@ -504,10 +570,28 @@ class MinimapTracker:
         t0 = time.perf_counter()
         crop = frame_rgb if is_already_cropped else self.roi.crop(frame_rgb)
         ch, cw = crop.shape[:2]
-        side = min(ch, cw)
-        y0 = (ch - side) // 2
-        x0 = (cw - side) // 2
-        crop_sq = crop[y0 : y0 + side, x0 : x0 + side]
+
+        # Optional ultra-fast ONNX neural pre-pass: auto-centers minimap inside any ROI + 360° heading + top-K zones!
+        neural_pred: Optional[NeuralPrediction] = None
+        if self.use_neural and self._neural is not None and self._neural.available:
+            neural_pred = self._neural.predict(crop, top_k=5)
+            self.last_neural_pred = neural_pred
+            if neural_pred is not None and neural_pred.best_prob >= 0.35 and neural_pred.best_slug in self.dungeons:
+                self.last_heading_deg = neural_pred.heading_deg
+                centered = self._neural.extract_autocentered_minimap(crop, neural_pred)
+                ch_c, cw_c = centered.shape[:2]
+                side = min(ch_c, cw_c)
+                y0 = (ch_c - side) // 2
+                x0 = (cw_c - side) // 2
+                crop_sq = centered[y0 : y0 + side, x0 : x0 + side]
+            else:
+                side = min(ch, cw)
+                crop_sq = crop[(ch - side) // 2 : (ch - side) // 2 + side, (cw - side) // 2 : (cw - side) // 2 + side]
+        else:
+            side = min(ch, cw)
+            y0 = (ch - side) // 2
+            x0 = (cw - side) // 2
+            crop_sq = crop[y0 : y0 + side, x0 : x0 + side]
         self.last_crop_rgb = crop_sq.copy()
 
         inner_sq = crop_inscribed_minimap(crop_sq)
@@ -565,7 +649,7 @@ class MinimapTracker:
             None if (self._executor is not None and self.high_precision) else {}
         )
 
-        def eval_fine(slug: str) -> Tuple[float, Tuple[float, float]]:
+        def eval_fine(slug: str, force_full_map: bool = False) -> Tuple[float, Tuple[float, float]]:
             self._ensure_precomputed(slug)
             d = self.dungeons[slug]
             ratio = self._scale_ratio[slug]
@@ -580,9 +664,18 @@ class MinimapTracker:
             scales_px = tuple(valid_scales)
             prev_wxy = None
             plaus_w = None
-            if slug == self.active_slug and self._smooth_px is not None:
-                prev_wxy = (float(self._smooth_px[0]) / ratio, float(self._smooth_px[1]) / ratio)
-                plaus_w = (plausible_yd * d.map_scale) / ratio
+            if not force_full_map:
+                if slug == self.active_slug and self._smooth_px is not None:
+                    prev_wxy = (float(self._smooth_px[0]) / ratio, float(self._smooth_px[1]) / ratio)
+                    plaus_w = (plausible_yd * d.map_scale) / ratio
+                elif (
+                    neural_pred is not None
+                    and neural_pred.best_slug == slug
+                    and neural_pred.best_prob >= 0.50
+                ):
+                    # Seed cold-start / post-cave re-acquisition with the neural (norm_u, norm_v) prediction
+                    prev_wxy = (float(neural_pred.norm_u) * float(w_sz), float(neural_pred.norm_v) * float(w_sz))
+                    plaus_w = max(24.0, float(w_sz) * 0.14)
             return self._match_single_dungeon(
                 slug, crop_sil, crop_edge, scales_px, angles_deg,
                 prev_work_xy=prev_wxy, plausible_radius_work=plaus_w,
@@ -602,6 +695,47 @@ class MinimapTracker:
             sc, xy = eval_fine(locked_slug)
             raw_scores[locked_slug] = sc
             best_xy_by_slug[locked_slug] = xy
+        elif (
+            neural_pred is not None
+            and neural_pred.best_prob < 0.25
+            and self._is_outdoor_zone.get(active_slug, False)
+            and self._smooth_px is not None
+            and active_slug in self.dungeons
+            and not (self._last_loading_screen_t is not None and (now_t - self._last_loading_screen_t) <= 15.0)
+        ):
+            # Inside an unmapped outdoor cave/tunnel (e.g. Searing Gorge Slag Pit, Feralas cave):
+            # neural model is clearly uncertain without a loading screen -> skip wasted 36-map scan (~8 ms total!)
+            raw_scores[active_slug] = 0.35
+            ratio_a = self._scale_ratio.get(active_slug, 1.0)
+            best_xy_by_slug[active_slug] = (float(self._smooth_px[0]) / ratio_a, float(self._smooth_px[1]) / ratio_a)
+        elif neural_pred is not None and neural_pred.best_prob >= 0.45 and neural_pred.best_slug in self.dungeons:
+            # Hybrid Neural Fast-Path (~10 ms total -> sustains 30-60 Hz polling on CPU!):
+            # If neural model strongly agrees with our already-locked active_slug, only refine active_slug locally!
+            prob_map = dict(neural_pred.top_slugs)
+            if (
+                neural_pred.best_slug == active_slug
+                and neural_pred.best_prob >= 0.55
+                and self._smooth_px is not None
+            ):
+                do_anchor = self.periodic_anchor and ((now_t - self._last_anchor_t) >= self.anchor_interval_sec)
+                if do_anchor:
+                    self._last_anchor_t = now_t
+                    sc_a, xy_a = eval_fine(active_slug, force_full_map=True)
+                else:
+                    sc_a, xy_a = eval_fine(active_slug)
+                raw_scores[active_slug] = 0.72 * sc_a + 0.28 * float(neural_pred.best_prob)
+                best_xy_by_slug[active_slug] = xy_a
+                for s in order:
+                    if s != active_slug:
+                        raw_scores[s] = max(0.0, raw_scores[active_slug] - 0.25)
+            else:
+                neural_cands = [s for s, _p in neural_pred.top_slugs[:3] if s in self.dungeons]
+                if active_slug in self.dungeons and active_slug not in neural_cands:
+                    neural_cands.append(active_slug)
+                for s in neural_cands:
+                    sc, xy = eval_fine(s)
+                    raw_scores[s] = 0.72 * sc + 0.28 * float(prob_map.get(s, 0.0))
+                    best_xy_by_slug[s] = xy
         else:
             # Fast-path: if already confident in active_slug, check it first—but NEVER get stuck!
             # Always force a full map check every 5 frames (at 1 Hz = every 5s) or if score < 0.68.
@@ -707,23 +841,58 @@ class MinimapTracker:
                 )
 
                 # Guard 1: Outdoor tunnel/cave/building protection.
-                # Walking into an indoor WMO tunnel (e.g. Orgrimmar gate tunnel, Feralas cave) turns the
-                # minimap into a dark-void corridor that spuriously matches black-void dungeon floorplans
-                # (Zul'Farrak, Razorfen Kraul, Scholomance, etc.). In WoW, you cannot enter an instanced
-                # dungeon from an outdoor zone without a loading screen!
+                # Walking into an indoor WMO tunnel/cave (e.g. Orgrimmar gate tunnel, Searing Gorge Slag Pit,
+                # Feralas cave) produces either high dark_void_frac OR very low neural certainty (best_prob < 0.25)
+                # while no loading screen occurred. Hold the current outdoor zone instead of hallucinating
+                # a dungeon or a distant Kalimdor/Eastern Kingdoms zone!
+                neural_cave_uncertain = (
+                    neural_pred is not None
+                    and neural_pred.best_prob < 0.25
+                    and not recent_loading
+                )
                 hold_outdoor_tunnel = (
                     active_is_outdoor
                     and self._smooth_px is not None
                     and active_slug in self.dungeons
                     and (
-                        (dark_void_frac > 0.28 and not cand_is_outdoor and not recent_loading)
+                        neural_cave_uncertain
+                        or (dark_void_frac > 0.28 and not cand_is_outdoor and not recent_loading)
                         or (dark_void_frac > 0.45 and best_raw < 0.52)
                     )
                 )
 
+                # Guard 1b: Geographic continuity — cannot teleport between non-adjacent outdoor zones
+                # (e.g. Searing Gorge -> Feralas/Silithus/Mulgore) without a loading screen unless
+                # the neural model itself is overwhelmingly certain (>= 0.72)!
+                hold_non_adjacent = False
+                if (
+                    not hold_outdoor_tunnel
+                    and best_slug != active_slug
+                    and active_is_outdoor
+                    and cand_is_outdoor
+                    and not recent_loading
+                    and self._smooth_px is not None
+                    and active_slug in self.dungeons
+                    and best_slug in self.dungeons
+                ):
+                    b_act = self.dungeons[active_slug].bounds_xy
+                    b_cnd = self.dungeons[best_slug].bounds_xy
+                    if b_act is not None and b_cnd is not None:
+                        # Check if bounding boxes overlap or are within 450 yd of each other
+                        gap_x = max(0.0, max(b_act[0] - b_cnd[2], b_cnd[0] - b_act[2]))
+                        gap_y = max(0.0, max(b_act[1] - b_cnd[3], b_cnd[1] - b_act[3]))
+                        if max(gap_x, gap_y) > 450.0:
+                            nn_confirms = (
+                                neural_pred is not None
+                                and neural_pred.best_slug == best_slug
+                                and neural_pred.best_prob >= 0.72
+                            )
+                            if not nn_confirms:
+                                hold_non_adjacent = True
+
                 # Guard 2: Weak-match & multi-frame switch hysteresis (prevents 1-frame zone ping-pong).
                 hold_switch = False
-                if not hold_outdoor_tunnel and best_slug != active_slug and self._smooth_px is not None and active_slug in self.dungeons:
+                if not hold_outdoor_tunnel and not hold_non_adjacent and best_slug != active_slug and self._smooth_px is not None and active_slug in self.dungeons:
                     if best_raw < 0.42:
                         hold_switch = True
                     else:
@@ -743,7 +912,7 @@ class MinimapTracker:
                             if self._switch_confirm_count < need_frames:
                                 hold_switch = True
 
-                if hold_outdoor_tunnel or hold_switch:
+                if hold_outdoor_tunnel or hold_non_adjacent or hold_switch:
                     best_slug = active_slug
                 else:
                     self._switch_cand_slug = None
@@ -779,7 +948,8 @@ class MinimapTracker:
             not (locked_slug and locked_slug in self.dungeons)
             and self._smooth_px is not None
             and (
-                (dark_void_frac > 0.28 and self._is_outdoor_zone.get(best_slug, False) and raw_scores.get(best_slug, 0.0) < 0.45)
+                (neural_pred is not None and neural_pred.best_prob < 0.25 and self._is_outdoor_zone.get(best_slug, False))
+                or (dark_void_frac > 0.28 and self._is_outdoor_zone.get(best_slug, False) and raw_scores.get(best_slug, 0.0) < 0.45)
                 or (dark_void_frac > 0.50 and raw_scores.get(best_slug, 0.0) < 0.48)
             )
         ):

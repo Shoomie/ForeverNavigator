@@ -334,7 +334,7 @@ class TestSubsystemSmoke(unittest.TestCase):
             s.fps = 99.0
             save_settings(p, s)
             s2 = load_settings(p)
-            self.assertEqual(s2.fps, 5.0)
+            self.assertEqual(s2.fps, 60.0)
 
     @unittest.skipUnless((INDEX_DIR / "manifest.json").exists(), "Index not present")
     def test_minimap_tracker_smoke_and_coord_roundtrip(self):
@@ -580,6 +580,83 @@ class TestWorldMapsAndModernUI(unittest.TestCase):
             self.assertIn("session_end", kinds)
             self.assertTrue(list((dl.session_dir / "minimap").glob("*.png")))
             self.assertTrue(list((dl.session_dir / "fullscreen").glob("*.jpg")))
+
+    @unittest.skipUnless((INDEX_DIR / "manifest.json").exists(), "Index not present")
+    def test_calibration_pipeline_replay_and_synthetic_bench(self):
+        import cv2
+        from src.navigator.calibration_pipeline import (
+            build_tracker_from_workspace,
+            format_compact_markdown,
+            replay_gameplay_run,
+            run_synthetic_ground_truth_bench,
+        )
+
+        tracker, _reg = build_tracker_from_workspace(INDEX_DIR, INDEX_DIR.parent / "cache" / "maps")
+        try:
+            syn = run_synthetic_ground_truth_bench(tracker, n_samples=4, seed=7)
+            self.assertGreaterEqual(syn.samples, 1)
+            with tempfile.TemporaryDirectory() as td:
+                run_dir = Path(td) / "run_20260101_000000"
+                (run_dir / "minimap").mkdir(parents=True)
+                img = np.full((96, 96, 3), 100, dtype=np.uint8)
+                cv2.imwrite(str(run_dir / "minimap" / "mm_1.png"), img)
+                cv2.imwrite(str(run_dir / "minimap" / "mm_2.png"), img)
+                m = replay_gameplay_run(run_dir, tracker, stride=1)
+                self.assertEqual(m.frames, 2)
+                md = format_compact_markdown({
+                    "generated_at": "test",
+                    "mode": "standard",
+                    "elapsed_sec": 0.1,
+                    "runs": [m.__dict__],
+                    "synthetic_ground_truth": syn.__dict__,
+                })
+                self.assertIn("ForeverNavigator Calibration Report", md)
+        finally:
+            tracker.close()
+
+    def test_neural_localizer_autocenter_and_hybrid_tracker(self):
+        import cv2
+        from src.navigator.neural_localizer import NeuralMinimapLocalizer, NeuralPrediction
+        from src.navigator.tracker import DungeonData
+
+        # Synthetic 512x512 dungeon map with a distinct textured room
+        rng = np.random.default_rng(123)
+        img = rng.integers(50, 190, size=(512, 512, 3), dtype=np.uint8)
+        d = DungeonData(
+            slug="ragefire_chasm", name="Ragefire Chasm", combatlog_keywords=[],
+            waypoints=np.zeros((1, 3), np.float32), adjacency=[[]], map_image=img,
+            map_origin_xy=np.zeros(2, np.float32), map_scale=1.0,
+            embeddings_f32=np.zeros((1, 4), np.float32), view_wp_idx=np.zeros(1, np.int32),
+            wp_to_views=[np.zeros(0, np.int32)],
+        )
+
+        # Mock localizer returning an off-center minimap prediction + 135 deg heading
+        class FakeNeural(NeuralMinimapLocalizer):
+            def __init__(self):
+                self.available = True
+
+            def predict(self, crop_rgb, top_k=5):
+                return NeuralPrediction(
+                    top_slugs=[("ragefire_chasm", 0.96)],
+                    norm_u=0.5, norm_v=0.5,
+                    mm_cx=0.60, mm_cy=0.55, mm_r=0.35,
+                    heading_deg=135.0,
+                    embedding=np.zeros(128, dtype=np.float32),
+                    inference_ms=1.2,
+                )
+
+        # Place the minimap patch off-center inside a 224x224 ROI (matching mm_cx=0.60, mm_cy=0.55, mm_r=0.35)
+        roi_img = np.zeros((224, 224, 3), dtype=np.uint8)
+        patch = img[190:322, 190:322]
+        cx, cy, r = int(round(0.60 * 224)), int(round(0.55 * 224)), int(round(0.35 * 224))
+        roi_img[cy - r : cy + r, cx - r : cx + r] = cv2.resize(patch, (2 * r, 2 * r))
+
+        tr = MinimapTracker({"ragefire_chasm": d}, ["ragefire_chasm"], neural_localizer=FakeNeural())
+        est = tr.update(roi_img, is_already_cropped=True)
+        self.assertEqual(est.dungeon_slug, "ragefire_chasm")
+        self.assertAlmostEqual(tr.last_heading_deg, 135.0, places=1)
+        self.assertGreater(est.position_confidence, 0.5)
+        tr.close()
 
 
 if __name__ == "__main__":

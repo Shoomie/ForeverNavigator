@@ -7,6 +7,8 @@ data/minimap_roi.json
 data/settings.json
 data/sessions/
 data/dev_gameplay/
+data/calibration/
+data/synth_dataset/
 data/logs/
 data/cache/
 data/listfile.csv

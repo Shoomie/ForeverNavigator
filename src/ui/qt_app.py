@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
 from ..combatlog.parser import iter_combatlog_file
 from ..combatlog.stats import analyze_combat_events
 from ..navigator.dev_logger import DevGameplayLogger
+from ..navigator.fast_capture import FastScreenCapturer
 from ..navigator.gpu_viewer3d import GPU3DViewer, find_wow_dir
 from ..navigator.minimap_tracker import MinimapROI, MinimapTracker, load_roi, save_roi
 from ..navigator.settings import (
@@ -723,13 +724,33 @@ class GPUMapViewport(QOpenGLWidget):
             p.setPen(QPen(QColor("#fc8181") if not alive else col))
             p.drawText(QPointF(sx + 9, sy + 3), label)
 
-        # Local player dot (solo mode)
+        # Local player marker (360° directional WoW chevron when neural heading is available, else dot)
         est = self.win._latest_est
         if est is not None and not self.win.replay_mode and self.win.identity.player_id not in shown:
             sx, sy = m2c(est.map_px[0], est.map_px[1])
-            p.setBrush(QBrush(QColor("#ff5a46")))
-            p.setPen(QPen(QColor("#ffffff"), 2.0))
-            p.drawEllipse(QPointF(sx, sy), 7.0, 7.0)
+            hdg = getattr(self.win.tracker_mm, "last_heading_deg", None)
+            if hdg is not None:
+                import math
+                rad = math.radians(float(hdg))
+                ca, sa = math.cos(rad), math.sin(rad)
+                sz = 11.0
+                pts_local = [(0.0, -sz), (sz * 0.68, sz * 0.72), (0.0, sz * 0.28), (-sz * 0.68, sz * 0.72)]
+                path = QPainterPath()
+                for idx_pt, (lx, ly) in enumerate(pts_local):
+                    rx = lx * ca - ly * sa + sx
+                    ry = lx * sa + ly * ca + sy
+                    if idx_pt == 0:
+                        path.moveTo(rx, ry)
+                    else:
+                        path.lineTo(rx, ry)
+                path.closeSubpath()
+                p.setBrush(QBrush(QColor("#f5d742")))
+                p.setPen(QPen(QColor("#14161c"), 2.0))
+                p.drawPath(path)
+            else:
+                p.setBrush(QBrush(QColor("#ff5a46")))
+                p.setPen(QPen(QColor("#ffffff"), 2.0))
+                p.drawEllipse(QPointF(sx, sy), 7.0, 7.0)
 
     # --- Mouse & Wheel Forwarding ---
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -1030,6 +1051,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
             rotate_minimap=self.settings.rotate_minimap,
             high_precision=self.settings.high_precision,
             lazy_precompute=True,
+            neural_model_name=self.settings.neural_model_name or None,
         )
         self.viewer_3d = GPU3DViewer(wow_dir=self.wow_dir, listfile_path=self.data_dir / "listfile.csv", product="wowf")
         try:
@@ -1232,6 +1254,28 @@ class ForeverNavigatorQtWindow(QMainWindow):
         cl.addLayout(opt_row)
 
         opt2 = QHBoxLayout()
+        self.chk_neural = QCheckBox("Neural AI")
+        has_nn = getattr(self.tracker_mm, "_neural", None) is not None
+        self.chk_neural.setChecked(bool(self.settings.use_neural_model) and has_nn)
+        self.chk_neural.setEnabled(has_nn)
+        self.chk_neural.setToolTip(
+            "Use trained ONNX neural model + OpenCV refinement (uncheck for Classic OpenCV only)"
+            if has_nn
+            else "No ONNX model found in data/models/"
+        )
+        self.chk_neural.setStyleSheet("color: #3fb950;")
+        self.chk_neural.toggled.connect(self._toggle_neural_model)
+        self.tracker_mm.set_use_neural(self.chk_neural.isChecked())
+        opt2.addWidget(self.chk_neural)
+
+        self.chk_anchor = QCheckBox("Anchor")
+        self.chk_anchor.setChecked(bool(self.settings.periodic_opencv_anchor))
+        self.chk_anchor.setToolTip("Periodic full-map OpenCV geometric anchor check (~every 2.5s) to prevent drift")
+        self.chk_anchor.setStyleSheet("color: #d2a8ff;")
+        self.chk_anchor.toggled.connect(self._toggle_periodic_anchor)
+        self.tracker_mm.set_periodic_anchor(self.chk_anchor.isChecked())
+        opt2.addWidget(self.chk_anchor)
+
         self.chk_hiprec = QCheckBox("Hi-Prec")
         self.chk_hiprec.setChecked(bool(self.settings.high_precision))
         self.chk_hiprec.setStyleSheet("color: #58a6ff;")
@@ -1247,6 +1291,52 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.cb_storage.currentTextChanged.connect(self._on_storage_mode_change)
         opt2.addWidget(self.cb_storage, 1)
         cl.addLayout(opt2)
+
+        opt3 = QHBoxLayout()
+        opt3.addWidget(QLabel("Polling:"))
+        self._fps_presets = [
+            ("1 Hz (Eco)", 1.0),
+            ("2 Hz (Standard)", 2.0),
+            ("5 Hz (Responsive)", 5.0),
+            ("10 Hz (Smooth)", 10.0),
+            ("15 Hz (Fast)", 15.0),
+            ("30 Hz (High Polling)", 30.0),
+            ("60 Hz (Extreme Polling)", 60.0),
+        ]
+        self._fps_label_to_val = {lbl: val for lbl, val in self._fps_presets}
+        self.cb_fps = QComboBox()
+        self.cb_fps.addItems([lbl for lbl, _ in self._fps_presets])
+        # Pick closest preset to saved self.fps
+        best_lbl = min(self._fps_presets, key=lambda kv: abs(kv[1] - self.fps))[0]
+        self.cb_fps.setCurrentText(best_lbl)
+        self.cb_fps.currentTextChanged.connect(self._on_fps_change)
+        opt3.addWidget(self.cb_fps, 1)
+        cl.addLayout(opt3)
+
+        from ..navigator.neural_localizer import format_model_label, list_available_onnx_models
+
+        opt_nn = QHBoxLayout()
+        opt_nn.addWidget(QLabel("Model:"))
+        self._model_label_to_stem: Dict[str, str] = {}
+        self.cb_model = QComboBox()
+        avail_models = list_available_onnx_models(self.data_dir / "models")
+        active_stem = getattr(getattr(self.tracker_mm, "_neural", None), "model_stem", "")
+        selected_lbl = ""
+        for stem, _onnx_p, meta_p in avail_models:
+            lbl = format_model_label(stem, meta_p)
+            self._model_label_to_stem[lbl] = stem
+            self.cb_model.addItem(lbl)
+            if stem == active_stem:
+                selected_lbl = lbl
+        if not avail_models:
+            self.cb_model.addItem("None found")
+            self.cb_model.setEnabled(False)
+        elif selected_lbl:
+            self.cb_model.setCurrentText(selected_lbl)
+        self.cb_model.setToolTip("Switch between available ONNX neural models in data/models/ live")
+        self.cb_model.currentTextChanged.connect(self._on_neural_model_change)
+        opt_nn.addWidget(self.cb_model, 1)
+        cl.addLayout(opt_nn)
 
         self.btn_view3d = QPushButton("View: 2D Map (GPU)")
         self.btn_view3d.clicked.connect(self._toggle_3d_view)
@@ -1824,6 +1914,41 @@ class ForeverNavigatorQtWindow(QMainWindow):
             self.world_maps.set_storage_mode(self._effective_storage_mode)
         self.lbl_stats.setText(f"Storage streaming: {self._effective_storage_mode.upper()} mode")
 
+    def _on_fps_change(self, lbl: str) -> None:
+        val = float(self._fps_label_to_val.get(lbl, 1.0))
+        self.fps = val
+        self.settings.fps = val
+        save_settings(self.settings_path, self.settings)
+        self.pill_fps.setText(f"{val:.0f} Hz" if val >= 5.0 else f"{val:.1f} Hz")
+        if self.running:
+            self._poll_timer.start(max(16, int(round(1000.0 / max(1.0, val)))))
+        self.lbl_stats.setText(f"Tracking polling rate: {lbl}")
+
+    def _toggle_neural_model(self, enabled: bool) -> None:
+        self.settings.use_neural_model = bool(enabled)
+        save_settings(self.settings_path, self.settings)
+        self.tracker_mm.set_use_neural(bool(enabled))
+        self.lbl_stats.setText(f"Tracker engine: {'Neural ONNX + OpenCV Hybrid' if enabled else 'Classic OpenCV Only'}")
+
+    def _toggle_periodic_anchor(self, enabled: bool) -> None:
+        self.settings.periodic_opencv_anchor = bool(enabled)
+        save_settings(self.settings_path, self.settings)
+        self.tracker_mm.set_periodic_anchor(bool(enabled))
+        self.lbl_stats.setText(f"Periodic OpenCV Anchor: {'ON (~2.5s)' if enabled else 'OFF (Max FPS)'}")
+
+    def _on_neural_model_change(self, label: str) -> None:
+        stem = self._model_label_to_stem.get(label, "")
+        if not stem:
+            return
+        ok = self.tracker_mm.set_neural_model(stem, models_dir=self.data_dir / "models")
+        if ok:
+            self.settings.neural_model_name = stem
+            save_settings(self.settings_path, self.settings)
+            self.chk_neural.setEnabled(True)
+            self.lbl_stats.setText(f"Switched Neural Model -> {label}")
+        else:
+            self.lbl_stats.setText(f"Failed to load model: {stem}")
+
     def _toggle_high_precision(self, enabled: bool) -> None:
         self.settings.high_precision = bool(enabled)
         save_settings(self.settings_path, self.settings)
@@ -2061,32 +2186,31 @@ class ForeverNavigatorQtWindow(QMainWindow):
             if self._showing_azeroth_overview:
                 self.lbl_dungeon.setText("Azeroth Overview — Searching for Position Fix...")
             threading.Thread(target=self._capture_loop, daemon=True, name="QtCaptureLoop").start()
-            self._poll_timer.start(200)
+            self._poll_timer.start(max(16, int(round(1000.0 / max(1.0, self.fps)))))
 
     def _capture_loop(self) -> None:
-        with mss.MSS() as sct:
+        last_fs_grab_t = 0.0
+        cap = FastScreenCapturer(self._selected_monitor)
+        self._ui_queue.put(("log", f"Capture backend: {cap.backend.upper()} ({self.fps:.0f} Hz target)"))
+        try:
             while self.running:
                 t0 = time.perf_counter()
                 interval = 1.0 / max(0.25, self.fps)
                 try:
-                    mon_idx = min(self._selected_monitor, len(sct.monitors) - 1)
-                    mon = sct.monitors[mon_idx]
+                    roi = self.tracker_mm.roi
+                    mm_rgb = cap.grab_roi(self._selected_monitor, roi.x0, roi.y0, roi.x1, roi.y1)
+                    capture_ms = (time.perf_counter() - t0) * 1000.0
+                    est = self.tracker_mm.update(mm_rgb, is_already_cropped=True)
                     if self.dev_logger.enabled:
-                        raw = sct.grab(mon)
-                        frame_rgb = cv2.cvtColor(np.asarray(raw), cv2.COLOR_BGRA2RGB)
-                        capture_ms = (time.perf_counter() - t0) * 1000.0
-                        est = self.tracker_mm.update(frame_rgb)
-                        self.dev_logger.log_tracker_tick(est, self.tracker_mm.locked_dungeon_slug, capture_ms, self.tracker_mm.last_crop_rgb, frame_rgb, self.tracker_mm.roi.to_dict())
-                    else:
-                        roi = self.tracker_mm.roi
-                        mw, mh = int(mon["width"]), int(mon["height"])
-                        rx0 = int(mon["left"]) + max(0, int(round(roi.x0 * mw)))
-                        ry0 = int(mon["top"]) + max(0, int(round(roi.y0 * mh)))
-                        rw = max(16, int(round((roi.x1 - roi.x0) * mw)))
-                        rh = max(16, int(round((roi.y1 - roi.y0) * mh)))
-                        mm_raw = sct.grab({"left": rx0, "top": ry0, "width": rw, "height": rh})
-                        mm_rgb = cv2.cvtColor(np.asarray(mm_raw), cv2.COLOR_BGRA2RGB)
-                        est = self.tracker_mm.update(mm_rgb, is_already_cropped=True)
+                        full_rgb = None
+                        now_m = time.monotonic()
+                        if (now_m - last_fs_grab_t) >= max(15.0, self.dev_logger.fullscreen_interval_sec):
+                            last_fs_grab_t = now_m
+                            full_rgb = cap.grab_fullscreen(self._selected_monitor)
+                        self.dev_logger.log_tracker_tick(
+                            est, self.tracker_mm.locked_dungeon_slug, capture_ms,
+                            self.tracker_mm.last_crop_rgb, full_rgb, roi.to_dict(),
+                        )
                     st = PlayerState(
                         player_id=self.identity.player_id,
                         name=self.identity.name,
@@ -2112,6 +2236,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
                 rem = interval - (time.perf_counter() - t0)
                 if rem > 0:
                     self._stop_capture_event.wait(timeout=rem)
+        finally:
+            cap.close()
 
     def _poll_tracker(self) -> None:
         if not self.running or self._closing:
@@ -2122,18 +2248,59 @@ class ForeverNavigatorQtWindow(QMainWindow):
             return
         self._last_rendered_est = est
         self.pill_pos.setText(f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%")
+        now_fps = time.perf_counter()
+        prev_fps_t = getattr(self, "_last_est_wall_t", None)
+        self._last_est_wall_t = now_fps
+        if prev_fps_t is not None and (now_fps - prev_fps_t) > 1e-4:
+            inst_hz = 1.0 / (now_fps - prev_fps_t)
+            ema = getattr(self, "_measured_hz", inst_hz)
+            self._measured_hz = 0.25 * inst_hz + 0.75 * ema
+            self.pill_fps.setText(f"{self._measured_hz:.1f} / {self.fps:.0f} Hz")
         if self._showing_azeroth_overview and self._transition_state is None:
+            self._maybe_autoload_neural_zone()
             if self._is_good_position_fix(est):
                 self._start_fix_transition(est)
         elif self._transition_state is None:
             if self.chk_follow.isChecked():
                 self.pan_x, self.pan_y = float(est.map_px[0]), float(est.map_px[1])
+            self._maybe_autoload_neural_zone()
             self._maybe_stream_nearby_zones(est)
             self.lbl_dungeon.setText(f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]")
             if self.view_3d_mode:
                 self._render_3d_frame()
             else:
                 self.viewport.update()
+
+    def _maybe_autoload_neural_zone(self) -> None:
+        """If the ONNX neural model strongly recognizes a WoW: Forever zone not yet loaded, stream it automatically."""
+        if self.world_maps is None:
+            return
+        pred = getattr(self.tracker_mm, "last_neural_pred", None)
+        if pred is None or pred.best_prob < 0.55:
+            return
+        slug = pred.best_slug
+        if not slug or slug in self.tracker_3d.dungeons:
+            return
+        loading_set = getattr(self, "_nearby_loading", None)
+        if loading_set is None:
+            loading_set = set()
+            self._nearby_loading = loading_set
+        if slug in loading_set:
+            return
+        entry = self.world_maps.get_entry(slug)
+        if entry is None:
+            return
+        loading_set.add(slug)
+
+        def _load_nn(s: str = slug) -> None:
+            try:
+                d = self.world_maps.load_map(s, preview_only=True)
+                if not self._closing and d is not None:
+                    self._ui_queue.put(("map_cached_register", (s, d)))
+            except Exception:
+                pass
+
+        threading.Thread(target=_load_nn, daemon=True, name=f"QtNeuralZone-{slug}").start()
 
     def _maybe_stream_nearby_zones(self, est: TrackerEstimate) -> None:
         """Auto-load any containing or adjacent WoW: Forever city/zone (e.g. Orgrimmar from Durotar)."""

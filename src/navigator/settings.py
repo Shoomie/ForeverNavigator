@@ -110,12 +110,15 @@ class AppSettings:
     rotate_minimap: bool = False
     adaptive_ui_mask: bool = True
     high_precision: bool = False
+    use_neural_model: bool = True
+    neural_model_name: str = ""      # "" = auto-select best available ONNX stem in data/models/
+    periodic_opencv_anchor: bool = True
     storage_mode: str = "auto"       # "auto", "ssd", "hdd"
     wow_dir: str = ""
     window_geometry: str = "1200x840"
 
     def clamped(self) -> "AppSettings":
-        self.fps = float(max(0.25, min(5.0, self.fps)))
+        self.fps = float(max(0.25, min(60.0, self.fps)))
         self.monitor = max(1, int(self.monitor))
         self.window_opacity = float(max(0.50, min(1.0, self.window_opacity)))
         self.brightness_3d = float(max(0.60, min(1.60, self.brightness_3d)))
