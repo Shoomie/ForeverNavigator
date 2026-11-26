@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import OrderedDict
 from pathlib import Path
 from tkinter import filedialog, simpledialog, ttk
 from typing import Any, Dict, List, Optional
@@ -65,7 +66,13 @@ from ..combatlog.stats import analyze_combat_events
 from ..navigator.dev_logger import DevGameplayLogger
 from ..navigator.gpu_viewer3d import GPU3DViewer, find_wow_dir
 from ..navigator.minimap_tracker import MinimapROI, MinimapTracker, load_roi, save_roi
-from ..navigator.settings import AppSettings, load_settings, save_settings
+from ..navigator.settings import (
+    AppSettings,
+    detect_storage_type,
+    load_settings,
+    resolve_storage_mode,
+    save_settings,
+)
 from ..navigator.spawns import get_spawns_for_dungeon
 from ..navigator.tracker import MultiDungeonTracker, TrackerEstimate
 from ..net.client import ForeverNavigatorClient
@@ -374,6 +381,8 @@ class ForeverNavigatorApp:
         self.settings: AppSettings = load_settings(self.settings_path)
         if fps is not None:
             self.settings.fps = float(fps)
+        self._detected_storage: str = detect_storage_type(self.data_dir)
+        self._effective_storage_mode: str = resolve_storage_mode(self.settings.storage_mode, self.data_dir)
 
         self.wow_dir = find_wow_dir(self.settings.wow_dir or None)
         self.wow_logs_dir = (self.wow_dir / "_forever_" / "Logs") if self.wow_dir else None
@@ -384,6 +393,7 @@ class ForeverNavigatorApp:
             dungeon_order=self.tracker_3d.dungeon_order,
             roi=load_roi(self.roi_path),
             rotate_minimap=self.settings.rotate_minimap,
+            high_precision=self.settings.high_precision,
         )
         self.viewer_3d = GPU3DViewer(wow_dir=self.wow_dir, listfile_path=self.data_dir / "listfile.csv", product="wowf")
         try:
@@ -394,6 +404,7 @@ class ForeverNavigatorApp:
                 cache_dir=self.data_dir / "cache" / "maps",
                 wow_dir=self.wow_dir,
             )
+            self.world_maps.set_storage_mode(self._effective_storage_mode)
         except Exception:
             self.world_maps = None
 
@@ -421,6 +432,14 @@ class ForeverNavigatorApp:
 
         self.fps = self.settings.fps
         self.running = False
+        self._stop_capture_event = threading.Event()
+        self._poll_after_id: Optional[str] = None
+        self._render_after_id: Optional[str] = None
+        self._settle_after_id: Optional[str] = None
+        self._is_interacting: bool = False
+        self._last_rendered_est: Optional[TrackerEstimate] = None
+        self._last_roster_sig: Optional[tuple] = None
+        self._selected_monitor: int = max(1, int(self.settings.monitor))
         self._latest_est: Optional[TrackerEstimate] = None
         self._latest_mm_crop: Optional[np.ndarray] = None
         self._lock = threading.Lock()
@@ -428,8 +447,18 @@ class ForeverNavigatorApp:
         self.pan_x, self.pan_y = 512.0, 512.0
         self._drag_last = None
         self._rdrag_last = None
-        self._cached_pil_maps: dict[str, Image.Image] = {}
+        self._cached_pil_maps: OrderedDict[str, Image.Image] = OrderedDict()
+        self._cached_mips: dict[str, list[tuple[int, Image.Image]]] = {}
+        self._streaming_slugs: set[str] = set()
         self._continent_maps: dict[str, Any] = {}
+        self._continent_loading: set[str] = set()
+        self._showing_azeroth_overview: bool = True
+        self._azeroth_overview: Optional[Any] = None
+        self._overview_zoom: float = 1.0
+        self._overview_pan_x: float = 800.0
+        self._overview_pan_y: float = 450.0
+        self._transition_after_id: Optional[str] = None
+        self._transition_state: Optional[dict[str, Any]] = None
         self.view_3d_mode = False
 
         self.root = tk.Tk()
@@ -444,6 +473,7 @@ class ForeverNavigatorApp:
 
         self._build_ui()
         self._refresh_map_catalog()
+        self._load_azeroth_overview_async()
         self._preload_cached_maps()
         self._render_current_map(None)
         self.root.after(50, self._drain_ui_queue)
@@ -576,16 +606,42 @@ class ForeverNavigatorApp:
 
         cap_opts = tk.Frame(c_cap, bg=BG_APP)
         cap_opts.pack(fill=tk.X, pady=(6, 0))
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             n_mons = max(1, len(sct.monitors) - 1)
         tk.Label(cap_opts, text="Mon:", bg=BG_APP, fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(side=tk.LEFT)
-        self.mon_var = tk.StringVar(value=str(min(self.settings.monitor, n_mons)))
-        ttk.Combobox(cap_opts, textvariable=self.mon_var, values=[str(i) for i in range(1, n_mons + 1)], width=3, state="readonly").pack(side=tk.LEFT, padx=(3, 8))
+        self._selected_monitor = min(self.settings.monitor, n_mons)
+        self.mon_var = tk.StringVar(value=str(self._selected_monitor))
+        mon_cb = ttk.Combobox(cap_opts, textvariable=self.mon_var, values=[str(i) for i in range(1, n_mons + 1)], width=3, state="readonly")
+        mon_cb.pack(side=tk.LEFT, padx=(3, 8))
+        mon_cb.bind("<<ComboboxSelected>>", lambda _e: setattr(self, "_selected_monitor", max(1, int(self.mon_var.get()))))
 
-        self.follow_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(cap_opts, text="Follow", variable=self.follow_var, bg=BG_APP, fg=ACCENT_GOLD, selectcolor=BG_ELEVATED, activebackground=BG_APP, activeforeground=ACCENT_GOLD, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 4))
-        self.spawns_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(cap_opts, text="Spawns", variable=self.spawns_var, command=lambda: self._render_current_map(self._latest_est, self._latest_mm_crop), bg=BG_APP, fg="#ffa53c", selectcolor=BG_ELEVATED, activebackground=BG_APP, activeforeground="#ffa53c", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        self.follow_var = tk.BooleanVar(value=bool(self.settings.follow_player))
+        tk.Checkbutton(cap_opts, text="Center Player", variable=self.follow_var, command=self._on_follow_toggle, bg=BG_APP, fg=ACCENT_GOLD, selectcolor=BG_ELEVATED, activebackground=BG_APP, activeforeground=ACCENT_GOLD, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 4))
+        self.spawns_var = tk.BooleanVar(value=bool(self.settings.show_spawns))
+        tk.Checkbutton(cap_opts, text="Spawns", variable=self.spawns_var, command=lambda: self._render_current_map(self._latest_est, self._latest_mm_crop), bg=BG_APP, fg="#ffa53c", selectcolor=BG_ELEVATED, activebackground=BG_APP, activeforeground="#ffa53c", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 4))
+        self.high_precision_var = tk.BooleanVar(value=bool(self.settings.high_precision))
+        tk.Checkbutton(cap_opts, text="Hi-Prec", variable=self.high_precision_var, command=self._toggle_high_precision, bg=BG_APP, fg=ACCENT_BLUE, selectcolor=BG_ELEVATED, activebackground=BG_APP, activeforeground=ACCENT_BLUE, font=("Segoe UI", 8)).pack(side=tk.LEFT)
+
+        stor_row = tk.Frame(c_cap, bg=BG_APP)
+        stor_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(stor_row, text="Storage:", bg=BG_APP, fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        auto_lbl = f"Auto ({self._detected_storage.upper()})"
+        self._storage_label_to_mode = {
+            auto_lbl: "auto",
+            "SSD (Low RAM)": "ssd",
+            "HDD (More Cache)": "hdd",
+        }
+        mode_to_lbl = {v: k for k, v in self._storage_label_to_mode.items()}
+        self.storage_var = tk.StringVar(value=mode_to_lbl.get(self.settings.storage_mode, auto_lbl))
+        stor_cb = ttk.Combobox(
+            stor_row,
+            textvariable=self.storage_var,
+            values=list(self._storage_label_to_mode.keys()),
+            width=16,
+            state="readonly",
+        )
+        stor_cb.pack(side=tk.LEFT, padx=(4, 0), fill=tk.X, expand=True)
+        stor_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_storage_mode_change())
 
         self.btn_view3d = tk.Button(c_cap, text="View: 2D Map", command=self._toggle_3d_view, bg=BG_ELEVATED, fg=TEXT_PRIMARY, relief=tk.FLAT, padx=8, pady=4, font=("Segoe UI", 8, "bold"), cursor="hand2")
         self.btn_view3d.pack(fill=tk.X, pady=(6, 0))
@@ -608,7 +664,7 @@ class ForeverNavigatorApp:
         cat_cb = ttk.Combobox(
             c_maps,
             textvariable=self.map_cat_var,
-            values=["All", "Raids", "Dungeons", "Battlegrounds", "Continents", "Zones", "Cities"],
+            values=["All", "Raids", "Dungeons", "Battlegrounds", "Continents", "Zones", "Cities", "Caves & Buildings", "Other"],
             state="readonly",
         )
         cat_cb.pack(fill=tk.X, pady=(0, 4))
@@ -716,7 +772,7 @@ class ForeverNavigatorApp:
 
         self.map_canvas = tk.Canvas(viewport, bg=BG_APP, highlightthickness=0, cursor="crosshair")
         self.map_canvas.pack(fill=tk.BOTH, expand=True)
-        self.map_canvas.bind("<Configure>", lambda _e: self._render_current_map(self._latest_est, self._latest_mm_crop))
+        self.map_canvas.bind("<Configure>", lambda _e: self._schedule_render(interacting=True))
         self.map_canvas.bind("<MouseWheel>", lambda e: self._adjust_zoom(1.18 if e.delta > 0 else 1 / 1.18))
         self.map_canvas.bind("<ButtonPress-1>", self._on_lpress)
         self.map_canvas.bind("<B1-Motion>", self._on_ldrag)
@@ -877,9 +933,35 @@ class ForeverNavigatorApp:
                 needs_render = True
             elif kind == "continent_loaded":
                 folder, cont_d = payload
+                self._continent_loading.discard(folder)
                 if cont_d is not None:
+                    # Keep only 1 lightweight continent backdrop in RAM at a time
+                    for old_f in list(self._continent_maps.keys()):
+                        if old_f != folder:
+                            self._continent_maps.pop(old_f, None)
+                            self._evict_cache_key(f"__cont_{old_f}")
                     self._continent_maps[folder] = cont_d
                     self._cached_pil_maps[f"__cont_{folder}"] = Image.fromarray(cont_d.map_image)
+                    self._cached_mips.pop(f"__cont_{folder}", None)
+                    needs_render = True
+            elif kind == "zone_fullres_loaded":
+                slug, pil_img = payload
+                self._streaming_slugs.discard(slug)
+                if pil_img is not None:
+                    self._put_display_pil(slug, pil_img)
+                    if slug == self._active_slug():
+                        needs_render = True
+            elif kind == "azeroth_overview_loaded":
+                ov = payload
+                if ov is not None:
+                    if self._azeroth_overview is not None:
+                        self._azeroth_overview.close()
+                    self._azeroth_overview = ov
+                    self._overview_pan_x = ov.width * 0.5
+                    self._overview_pan_y = ov.height * 0.5
+                    self._overview_zoom = 1.0
+                    if self._showing_azeroth_overview:
+                        needs_render = True
             elif kind == "map_cached_register":
                 slug, dungeon = payload
                 if dungeon is not None and slug not in self.tracker_3d.dungeons:
@@ -911,7 +993,13 @@ class ForeverNavigatorApp:
                     self.tracker_mm.active_slug = slug
                     self.dungeon_var.set(dungeon.name)
                     self._latest_est = None
-                    self.lbl_map_status.config(text=f"Loaded {dungeon.name}")
+                    self._cancel_fix_transition()
+                    self._showing_azeroth_overview = False
+                    entry = self.world_maps.get_entry(slug) if self.world_maps is not None else None
+                    if entry is not None and entry.is_shared:
+                        self.lbl_map_status.config(text=f"Loaded {dungeon.name} (Shared Cave/Building)")
+                    else:
+                        self.lbl_map_status.config(text=f"Loaded {dungeon.name}")
                     self._reset_view()
                     needs_render = True
         if needs_render:
@@ -934,7 +1022,7 @@ class ForeverNavigatorApp:
 
     def _canvas_to_uv(self, sx: float, sy: float) -> tuple[float, float]:
         cw, ch = max(1, self.map_canvas.winfo_width()), max(1, self.map_canvas.winfo_height())
-        map_h = self.tracker_3d.dungeons[self._active_slug()].map_image.shape[0]
+        map_h = self.tracker_3d.dungeons[self._active_slug()].map_size_px
         sc = self._eff_scale(cw, ch, map_h)
         mx = self.pan_x + (sx - cw * 0.5) / sc
         my = self.pan_y + (sy - ch * 0.5) / sc
@@ -988,28 +1076,40 @@ class ForeverNavigatorApp:
         self._drag_last = (event.x, event.y)
         if self.view_3d_mode:
             self.viewer_3d.orbit(dx, dy)
-            self._render_current_map(self._latest_est, self._latest_mm_crop)
+            self._schedule_render(interacting=True)
+            return
+
+        if self._showing_azeroth_overview:
+            self._cancel_fix_transition()
+            if self._azeroth_overview is not None:
+                cw, ch = max(1, self.map_canvas.winfo_width()), max(1, self.map_canvas.winfo_height())
+                sc_ov = self._overview_eff_scale(cw, ch)
+                self._overview_pan_x = float(np.clip(self._overview_pan_x - dx / sc_ov, 0, self._azeroth_overview.width))
+                self._overview_pan_y = float(np.clip(self._overview_pan_y - dy / sc_ov, 0, self._azeroth_overview.height))
+                self._schedule_render(interacting=True)
             return
 
         tool = self.tool_var.get()
         d = self.tracker_3d.dungeons[self._active_slug()]
+        map_h = d.map_size_px
         if tool == "Pan":
-            self.follow_var.set(False)
+            if self.follow_var.get():
+                self.follow_var.set(False)
             cw, ch = max(1, self.map_canvas.winfo_width()), max(1, self.map_canvas.winfo_height())
-            sc = self._eff_scale(cw, ch, d.map_image.shape[0])
-            self.pan_x = float(np.clip(self.pan_x - dx / sc, 0, d.map_image.shape[0]))
-            self.pan_y = float(np.clip(self.pan_y - dy / sc, 0, d.map_image.shape[0]))
-            self._render_current_map(self._latest_est, self._latest_mm_crop)
+            sc = self._eff_scale(cw, ch, map_h)
+            self.pan_x = float(np.clip(self.pan_x - dx / sc, 0, map_h))
+            self.pan_y = float(np.clip(self.pan_y - dy / sc, 0, map_h))
+            self._schedule_render(interacting=True)
         elif tool == "Ruler (yd)" and self.active_ruler is not None:
             uv = self._canvas_to_uv(event.x, event.y)
-            yd = measure_yards(*self.active_ruler.start_uv, *uv, d.map_image.shape[0], d.map_scale)
+            yd = measure_yards(*self.active_ruler.start_uv, *uv, map_h, d.map_scale)
             self.active_ruler = RulerMeasurement(self.active_ruler.start_uv, uv, yd)
-            self._render_current_map(self._latest_est, self._latest_mm_crop)
+            self._schedule_render(interacting=True)
         elif tool == "Draw":
             if not self._active_stroke_pts:
                 return
             self._active_stroke_pts.append(self._canvas_to_uv(event.x, event.y))
-            self._render_current_map(self._latest_est, self._latest_mm_crop)
+            self._schedule_render(interacting=True)
 
     def _on_lrelease(self, _event) -> None:
         self._drag_last = None
@@ -1033,7 +1133,7 @@ class ForeverNavigatorApp:
         self._rdrag_last = (event.x, event.y)
         self.follow_var.set(False)
         self.viewer_3d.pan(dx, dy, self._active_slug())
-        self._render_current_map(self._latest_est, self._latest_mm_crop)
+        self._schedule_render(interacting=True)
 
     def _undo_draw(self) -> None:
         if not self._can_edit_whiteboard():
@@ -1101,8 +1201,226 @@ class ForeverNavigatorApp:
         self.dungeon_var.set("Auto-Detect")
         self.tracker_mm.locked_dungeon_slug = None
         self._latest_est = None
+        self._cancel_fix_transition()
+        self._showing_azeroth_overview = True
+        self._overview_zoom = 1.0
+        if self._azeroth_overview is not None:
+            self._overview_pan_x = self._azeroth_overview.width * 0.5
+            self._overview_pan_y = self._azeroth_overview.height * 0.5
         self.lbl_map_status.config(text="Auto-Detect enabled")
         self._reset_view()
+
+    def _load_azeroth_overview_async(self) -> None:
+        """Build the lightweight Kalimdor + Eastern Kingdoms world overview on a background thread."""
+
+        def _worker() -> None:
+            try:
+                from ..navigator.world_maps import build_azeroth_overview
+
+                ov = build_azeroth_overview(self.world_maps, width=1600, height=900)
+                if not self._closing:
+                    self._ui_queue.put(("azeroth_overview_loaded", ov))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="BuildAzerothOverview").start()
+
+    def _overview_eff_scale(self, cw: int, ch: int) -> float:
+        ov_w = float(self._azeroth_overview.width) if self._azeroth_overview is not None else 1600.0
+        ov_h = float(self._azeroth_overview.height) if self._azeroth_overview is not None else 900.0
+        base_sc = min(max(64, cw) / ov_w, max(64, ch) / ov_h)
+        return base_sc * self._overview_zoom
+
+    @staticmethod
+    def _is_good_position_fix(est: Optional[TrackerEstimate]) -> bool:
+        if est is None:
+            return False
+        return (est.position_confidence >= 0.42) or (
+            est.dungeon_confidence >= 0.55 and est.position_confidence >= 0.35
+        )
+
+    def _cancel_fix_transition(self) -> None:
+        if self._transition_after_id is not None:
+            try:
+                self.root.after_cancel(self._transition_after_id)
+            except Exception:
+                pass
+            self._transition_after_id = None
+        self._transition_state = None
+
+    def _start_fix_transition(self, est: TrackerEstimate) -> None:
+        """Smoothly zoom from the Azeroth overview directly into the player's detected zone & position."""
+        self._cancel_fix_transition()
+        d = self.tracker_3d.dungeons.get(est.dungeon_slug)
+        if d is None:
+            self._showing_azeroth_overview = False
+            self._render_current_map(est, self._latest_mm_crop)
+            return
+
+        # Start streaming the target zone's full-res map from SSD while the zoom-in plays
+        self._ensure_fullres_display(est.dungeon_slug, d)
+
+        if self._azeroth_overview is None:
+            self._showing_azeroth_overview = False
+            self.pan_x, self.pan_y = float(est.map_px[0]), float(est.map_px[1])
+            self.zoom = 1.4
+            self.lbl_zoom.config(text=f"{int(round(self.zoom * 100))}%")
+            self._render_current_map(est, self._latest_mm_crop)
+            return
+
+        entry = self.world_maps.get_entry(est.dungeon_slug) if self.world_maps is not None else None
+        folder = entry.minimap_folder if entry is not None else None
+        tx_ov, ty_ov = self._azeroth_overview.world_to_overview_px(
+            folder, float(est.world_pos[0]), float(est.world_pos[1])
+        )
+        self._transition_state = {
+            "t0": time.perf_counter(),
+            "duration": 0.70,
+            "start_pan": (self._overview_pan_x, self._overview_pan_y),
+            "target_ov": (tx_ov, ty_ov),
+            "start_zoom": self._overview_zoom,
+            "est": est,
+        }
+        self._is_interacting = True
+        self._step_fix_transition()
+
+    def _step_fix_transition(self) -> None:
+        self._transition_after_id = None
+        st = self._transition_state
+        if st is None or self._closing:
+            return
+        elapsed = time.perf_counter() - st["t0"]
+        t = min(1.0, elapsed / st["duration"])
+        est: TrackerEstimate = self._latest_est or st["est"]
+        split = 0.62
+
+        if t < split:
+            u = t / split
+            ease = 1.0 - (1.0 - u) ** 3
+            sx, sy = st["start_pan"]
+            tx, ty = st["target_ov"]
+            self._overview_pan_x = sx + (tx - sx) * ease
+            self._overview_pan_y = sy + (ty - sy) * ease
+            self._overview_zoom = st["start_zoom"] * (6.5 ** ease)
+            self._showing_azeroth_overview = True
+            self._render_current_map(est, self._latest_mm_crop)
+        else:
+            u = (t - split) / max(1e-4, 1.0 - split)
+            ease = 1.0 - (1.0 - u) ** 3
+            self._showing_azeroth_overview = False
+            self.pan_x = float(est.map_px[0])
+            self.pan_y = float(est.map_px[1])
+            self.zoom = 0.65 + (1.45 - 0.65) * ease
+            self.lbl_zoom.config(text=f"{int(round(self.zoom * 100))}%")
+            self._render_current_map(est, self._latest_mm_crop)
+
+        if t < 1.0:
+            self._transition_after_id = self.root.after(16, self._step_fix_transition)
+        else:
+            self._transition_state = None
+            self._is_interacting = False
+            self._render_current_map(est, self._latest_mm_crop)
+
+    def _on_follow_toggle(self) -> None:
+        enabled = bool(self.follow_var.get())
+        self.settings.follow_player = enabled
+        save_settings(self.settings_path, self.settings)
+        if enabled and self._latest_est is not None and not self.replay_mode:
+            self.pan_x = float(self._latest_est.map_px[0])
+            self.pan_y = float(self._latest_est.map_px[1])
+            self._render_current_map(self._latest_est, self._latest_mm_crop)
+
+    def _on_storage_mode_change(self) -> None:
+        lbl = self.storage_var.get()
+        mode = self._storage_label_to_mode.get(lbl, "auto")
+        self.settings.storage_mode = mode
+        save_settings(self.settings_path, self.settings)
+        self._effective_storage_mode = resolve_storage_mode(mode, self.data_dir)
+        if self.world_maps is not None and hasattr(self.world_maps, "set_storage_mode"):
+            self.world_maps.set_storage_mode(self._effective_storage_mode)
+        self._trim_display_cache(keep_slug=self._active_slug())
+        self.lbl_stats.config(text=f"Storage streaming: {self._effective_storage_mode.upper()} mode")
+
+    def _display_cache_limit(self) -> int:
+        return 3 if self._effective_storage_mode == "hdd" else 1
+
+    def _evict_cache_key(self, key: str) -> None:
+        im = self._cached_pil_maps.pop(key, None)
+        mips = self._cached_mips.pop(key, None)
+        if mips:
+            for _div, mip_im in mips:
+                if mip_im is not im:
+                    try:
+                        mip_im.close()
+                    except Exception:
+                        pass
+        if im is not None:
+            try:
+                im.close()
+            except Exception:
+                pass
+
+    def _trim_display_cache(self, keep_slug: Optional[str] = None) -> None:
+        limit = self._display_cache_limit()
+        zone_keys = [k for k in self._cached_pil_maps.keys() if not k.startswith("__cont_")]
+        while len(zone_keys) > limit:
+            evict_k = next((k for k in zone_keys if k != keep_slug), zone_keys[0])
+            zone_keys.remove(evict_k)
+            self._evict_cache_key(evict_k)
+
+    def _put_display_pil(self, slug: str, pil_img: Image.Image) -> None:
+        if slug in self._cached_pil_maps:
+            self._evict_cache_key(slug)
+        self._cached_pil_maps[slug] = pil_img
+        self._cached_pil_maps.move_to_end(slug)
+        self._trim_display_cache(keep_slug=slug)
+
+    def _ensure_fullres_display(self, slug: str, d: Any) -> Image.Image:
+        """Return the best resident PIL image for `slug`, streaming full-res from storage on-demand."""
+        cached = self._cached_pil_maps.get(slug)
+        if cached is not None:
+            self._cached_pil_maps.move_to_end(slug)
+            return cached
+
+        # Kick off async streaming from disk when `d.map_image` is a low-RAM preview
+        full_path = getattr(d, "map_full_path", None)
+        if (
+            full_path is not None
+            and d.map_image.shape[0] < d.map_size_px
+            and slug not in self._streaming_slugs
+        ):
+            self._streaming_slugs.add(slug)
+
+            def _stream_worker(p: Path = Path(full_path), target_slug: str = slug) -> None:
+                pil_im: Optional[Image.Image] = None
+                try:
+                    if p.suffix.lower() == ".png" and p.exists():
+                        with Image.open(p) as raw_im:
+                            pil_im = raw_im.convert("RGB")
+                    elif p.exists():
+                        with np.load(p, allow_pickle=False) as z:
+                            pil_im = Image.fromarray(z["map_image"].astype(np.uint8))
+                except Exception:
+                    pil_im = None
+                if not self._closing:
+                    self._ui_queue.put(("zone_fullres_loaded", (target_slug, pil_im)))
+
+            threading.Thread(target=_stream_worker, daemon=True, name=f"StreamMap-{slug}").start()
+
+        # Return lightweight preview immediately (zero stall) without polluting the full-res LRU
+        return Image.fromarray(d.map_image)
+
+    def _toggle_high_precision(self) -> None:
+        enabled = bool(self.high_precision_var.get())
+        self.settings.high_precision = enabled
+        save_settings(self.settings_path, self.settings)
+        threading.Thread(
+            target=lambda: self.tracker_mm.set_high_precision(enabled),
+            daemon=True,
+            name="ToggleHighPrecision",
+        ).start()
+        mode_lbl = "High Precision (CPU+GPU)" if enabled else "Standard"
+        self.lbl_stats.config(text=f"Tracking mode: {mode_lbl}")
 
     def _load_selected_map(self) -> None:
         sel = self.map_listbox.curselection()
@@ -1119,6 +1437,8 @@ class ForeverNavigatorApp:
             self.tracker_mm.active_slug = slug
             self.dungeon_var.set(entry.name)
             self._latest_est = None
+            self._cancel_fix_transition()
+            self._showing_azeroth_overview = False
             self.lbl_map_status.config(text=f"Active: {entry.name}")
             self._reset_view()
             return
@@ -1130,6 +1450,7 @@ class ForeverNavigatorApp:
         self.world_maps.load_map_async(
             slug,
             lambda s, d, e: self._ui_queue.put(("map_loaded", (s, d, e))),
+            preview_only=True,
         )
 
     def _preload_cached_maps(self) -> None:
@@ -1137,27 +1458,60 @@ class ForeverNavigatorApp:
             return
 
         def _worker() -> None:
-            for cont_slug, folder in (("kalimdor", "Kalimdor"), ("eastern_kingdoms", "Azeroth")):
-                if self._closing:
-                    return
-                try:
-                    cont_d = self.world_maps.load_map(cont_slug)
-                    if not self._closing:
-                        self._ui_queue.put(("continent_loaded", (folder, cont_d)))
-                except Exception:
-                    pass
             for entry in list(self._all_map_entries):
                 if self._closing:
                     return
                 if entry.cached and entry.slug not in self.tracker_3d.dungeons and entry.category != "Continents":
                     try:
-                        d = self.world_maps.load_map(entry.slug)
+                        d = self.world_maps.load_map(entry.slug, preview_only=True)
                         if not self._closing:
                             self._ui_queue.put(("map_cached_register", (entry.slug, d)))
                     except Exception:
                         pass
 
         threading.Thread(target=_worker, daemon=True, name="PreloadCachedMaps").start()
+
+    def _ensure_continent_backdrop(self, folder: str) -> None:
+        """Lazily load only a lightweight (1536px) continent backdrop for the currently viewed zone."""
+        if self.world_maps is None or folder in self._continent_maps or folder in self._continent_loading:
+            return
+        cont_slug = "kalimdor" if folder == "Kalimdor" else ("eastern_kingdoms" if folder == "Azeroth" else None)
+        if cont_slug is None:
+            return
+        self._continent_loading.add(folder)
+
+        def _worker() -> None:
+            try:
+                cont_d = self.world_maps.load_map(cont_slug, preview_only=True, max_preview_px=1536)
+                if not self._closing:
+                    self._ui_queue.put(("continent_loaded", (folder, cont_d)))
+            except Exception:
+                self._continent_loading.discard(folder)
+
+        threading.Thread(target=_worker, daemon=True, name=f"LoadCont-{folder}").start()
+
+    def _get_mip_for_scale(self, key: str, full_pil: Image.Image, target_scale: float) -> tuple[Image.Image, int]:
+        """Return (mip_image, divisor) capped to viewport resolution so we never oversample pixels."""
+        mips = self._cached_mips.get(key)
+        if mips is None or mips[0][1] is not full_pil:
+            mips = [(1, full_pil)]
+            cur = full_pil
+            div = 1
+            while min(cur.width, cur.height) > 768 and div < 16:
+                nw, nh = max(256, cur.width // 2), max(256, cur.height // 2)
+                cur = cur.resize((nw, nh), Image.Resampling.BILINEAR)
+                div *= 2
+                mips.append((div, cur))
+            if not hasattr(self, "_cached_pil_maps") or key in self._cached_pil_maps:
+                self._cached_mips[key] = mips
+
+        chosen_div, chosen_im = mips[0]
+        for div, im in mips:
+            if target_scale * div <= 1.05:
+                chosen_div, chosen_im = div, im
+            else:
+                break
+        return chosen_im, chosen_div
 
     def _preload_all_zones(self) -> None:
         if self.world_maps is None:
@@ -1171,7 +1525,7 @@ class ForeverNavigatorApp:
                 if self._closing:
                     return
                 try:
-                    d = self.world_maps.load_map(entry.slug)
+                    d = self.world_maps.load_map(entry.slug, preview_only=True)
                     done += 1
                     if not self._closing:
                         self._ui_queue.put(("map_cached_register", (entry.slug, d)))
@@ -1205,6 +1559,13 @@ class ForeverNavigatorApp:
     def _refresh_roster(self, shown_players: Dict[str, PlayerState]) -> None:
         if not hasattr(self, "roster_tree"):
             return
+        sig = tuple(
+            (pid, p.name, p.role, p.dungeon_slug, bool(getattr(p, "alive", True)))
+            for pid, p in shown_players.items()
+        )
+        if sig == self._last_roster_sig:
+            return
+        self._last_roster_sig = sig
         for item in self.roster_tree.get_children():
             self.roster_tree.delete(item)
         for p in shown_players.values():
@@ -1212,21 +1573,58 @@ class ForeverNavigatorApp:
             self.roster_tree.insert("", tk.END, text=p.name, values=(_role_badge(p.role), p.dungeon_slug or "-", alive_txt))
         self.lbl_roster_hdr.config(text=f"Guildmates ({len(shown_players)})")
 
+    def _schedule_render(self, interacting: bool = False) -> None:
+        """Coalesce rapid pan/zoom/resize events to ~60 FPS and defer full-res CASC tiles until settled."""
+        if self._closing:
+            return
+        if interacting:
+            self._is_interacting = True
+            if self._settle_after_id is not None:
+                try:
+                    self.root.after_cancel(self._settle_after_id)
+                except Exception:
+                    pass
+            self._settle_after_id = self.root.after(140, self._on_interaction_settled)
+        if self._render_after_id is None:
+            self._render_after_id = self.root.after(16, self._flush_scheduled_render)
+
+    def _flush_scheduled_render(self) -> None:
+        self._render_after_id = None
+        if self._closing:
+            return
+        self._render_current_map(self._latest_est, self._latest_mm_crop)
+
+    def _on_interaction_settled(self) -> None:
+        self._settle_after_id = None
+        if self._closing:
+            return
+        self._is_interacting = False
+        self._render_current_map(self._latest_est, self._latest_mm_crop)
+
     def _adjust_zoom(self, factor: float) -> None:
         if self.view_3d_mode:
             self.viewer_3d.zoom = float(np.clip(self.viewer_3d.zoom * factor, 0.4, 6.0))
             self.lbl_zoom.config(text=f"{int(round(self.viewer_3d.zoom * 100))}%")
+        elif self._showing_azeroth_overview:
+            self._cancel_fix_transition()
+            self._overview_zoom = float(np.clip(self._overview_zoom * factor, 0.5, 64.0))
+            self.lbl_zoom.config(text=f"{int(round(self._overview_zoom * 100))}%")
         else:
             self.zoom = float(np.clip(self.zoom * factor, 0.10, 8.0))
             self.lbl_zoom.config(text=f"{int(round(self.zoom * 100))}%")
-        self._render_current_map(self._latest_est, self._latest_mm_crop)
+        self._schedule_render(interacting=True)
 
     def _reset_view(self) -> None:
         if self.view_3d_mode:
             self.viewer_3d.reset_camera(self._active_slug())
+        elif self._showing_azeroth_overview:
+            self._overview_zoom = 1.0
+            if self._azeroth_overview is not None:
+                self._overview_pan_x = self._azeroth_overview.width * 0.5
+                self._overview_pan_y = self._azeroth_overview.height * 0.5
         else:
             self.zoom = 1.0
-            half = self.tracker_3d.dungeons[self._active_slug()].map_image.shape[0] * 0.5
+            half = self.tracker_3d.dungeons[self._active_slug()].map_size_px * 0.5
             self.pan_x, self.pan_y = half, half
         self.lbl_zoom.config(text="100%")
         self._render_current_map(self._latest_est, self._latest_mm_crop)
@@ -1246,8 +1644,8 @@ class ForeverNavigatorApp:
         self._reset_view()
 
     def _pick_minimap_box(self) -> None:
-        with mss.mss() as sct:
-            mon = dict(sct.monitors[min(int(self.mon_var.get()), len(sct.monitors) - 1)])
+        with mss.MSS() as sct:
+            mon = dict(sct.monitors[min(self._selected_monitor, len(sct.monitors) - 1)])
 
         def on_roi(roi: MinimapROI):
             self.tracker_mm.roi = roi
@@ -1281,33 +1679,53 @@ class ForeverNavigatorApp:
     def _toggle_capture(self) -> None:
         if self.running:
             self.running = False
+            self._stop_capture_event.set()
+            if self._poll_after_id is not None:
+                try:
+                    self.root.after_cancel(self._poll_after_id)
+                except Exception:
+                    pass
+                self._poll_after_id = None
             self.btn_toggle.config(text="Start Capture", bg="#1f6feb")
         else:
             self.running = True
+            self._stop_capture_event.clear()
             self.btn_toggle.config(text="Stop Capture", bg=ACCENT_RED)
-            threading.Thread(target=self._capture_loop, daemon=True).start()
-            self.root.after(200, self._poll_ui)
+            threading.Thread(target=self._capture_loop, daemon=True, name="CaptureLoop").start()
+            if self._poll_after_id is None:
+                self._poll_after_id = self.root.after(200, self._poll_ui)
 
     def _capture_loop(self) -> None:
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             while self.running:
                 t0 = time.perf_counter()
                 interval = 1.0 / max(0.25, self.fps)
                 try:
-                    mon_idx = min(int(self.mon_var.get()), len(sct.monitors) - 1)
+                    mon_idx = min(self._selected_monitor, len(sct.monitors) - 1)
                     mon = sct.monitors[mon_idx]
-                    raw = sct.grab(mon)
-                    frame_rgb = cv2.cvtColor(np.asarray(raw), cv2.COLOR_BGRA2RGB)
-                    capture_ms = (time.perf_counter() - t0) * 1000.0
-                    est = self.tracker_mm.update(frame_rgb)
-                    self.dev_logger.log_tracker_tick(
-                        est,
-                        self.tracker_mm.locked_dungeon_slug,
-                        capture_ms,
-                        self.tracker_mm.last_crop_rgb,
-                        frame_rgb,
-                        self.tracker_mm.roi.to_dict(),
-                    )
+                    if self.dev_logger.enabled:
+                        raw = sct.grab(mon)
+                        frame_rgb = cv2.cvtColor(np.asarray(raw), cv2.COLOR_BGRA2RGB)
+                        capture_ms = (time.perf_counter() - t0) * 1000.0
+                        est = self.tracker_mm.update(frame_rgb)
+                        self.dev_logger.log_tracker_tick(
+                            est,
+                            self.tracker_mm.locked_dungeon_slug,
+                            capture_ms,
+                            self.tracker_mm.last_crop_rgb,
+                            frame_rgb,
+                            self.tracker_mm.roi.to_dict(),
+                        )
+                    else:
+                        roi = self.tracker_mm.roi
+                        mw, mh = int(mon["width"]), int(mon["height"])
+                        rx0 = int(mon["left"]) + max(0, int(round(roi.x0 * mw)))
+                        ry0 = int(mon["top"]) + max(0, int(round(roi.y0 * mh)))
+                        rw = max(16, int(round((roi.x1 - roi.x0) * mw)))
+                        rh = max(16, int(round((roi.y1 - roi.y0) * mh)))
+                        mm_raw = sct.grab({"left": rx0, "top": ry0, "width": rw, "height": rh})
+                        mm_rgb = cv2.cvtColor(np.asarray(mm_raw), cv2.COLOR_BGRA2RGB)
+                        est = self.tracker_mm.update(mm_rgb, is_already_cropped=True)
                     st = PlayerState(
                         player_id=self.identity.player_id,
                         name=self.identity.name,
@@ -1338,9 +1756,10 @@ class ForeverNavigatorApp:
                     if rem <= 0:
                         break
                     if self.dev_logger.enabled and rem > self.dev_logger.minimap_interval_sec:
-                        time.sleep(self.dev_logger.minimap_interval_sec)
+                        if self._stop_capture_event.wait(timeout=self.dev_logger.minimap_interval_sec):
+                            break
                         try:
-                            mon_idx = min(int(self.mon_var.get()), len(sct.monitors) - 1)
+                            mon_idx = min(self._selected_monitor, len(sct.monitors) - 1)
                             mon = sct.monitors[mon_idx]
                             roi = self.tracker_mm.roi
                             mw, mh = int(mon["width"]), int(mon["height"])
@@ -1354,17 +1773,25 @@ class ForeverNavigatorApp:
                         except Exception as exc:
                             self.dev_logger.log_event("minimap_poll_error", {"error": str(exc)})
                     else:
-                        time.sleep(rem)
+                        self._stop_capture_event.wait(timeout=rem)
                         break
 
     def _poll_ui(self) -> None:
-        if not self.running:
+        self._poll_after_id = None
+        if not self.running or self._closing:
             return
         with self._lock:
             est, mm = self._latest_est, self._latest_mm_crop
-        if est is not None and not self.replay_mode:
-            self._render_current_map(est, mm)
-        self.root.after(200, self._poll_ui)
+        if est is not None and est is not self._last_rendered_est and not self.replay_mode:
+            self._last_rendered_est = est
+            if self._showing_azeroth_overview and self._transition_state is None:
+                if self._is_good_position_fix(est):
+                    self._start_fix_transition(est)
+                else:
+                    self._render_current_map(est, mm)
+            elif self._transition_state is None:
+                self._render_current_map(est, mm)
+        self._poll_after_id = self.root.after(200, self._poll_ui)
 
     # --- Rendering ---
     def _render_current_map(self, est: Optional[TrackerEstimate], mm_crop: Optional[np.ndarray] = None) -> None:
@@ -1373,12 +1800,86 @@ class ForeverNavigatorApp:
             cw, ch = 780, 660
         slug = self._active_slug()
         d = self.tracker_3d.dungeons[slug]
-        map_h = d.map_image.shape[0]
+        map_h = d.map_size_px
         self.map_canvas.delete("all")
 
         shown_players = self.replay_players if self.replay_mode else self.raid_players
         self._update_live_pills(est)
         self._refresh_roster(shown_players)
+
+        # Startup / pre-fix Azeroth Overview (Kalimdor + Eastern Kingdoms, viewport-capped with deep full-res zoom)
+        if self._showing_azeroth_overview and not self.view_3d_mode and not self.replay_mode:
+            if self._azeroth_overview is not None:
+                sc_ov = self._overview_eff_scale(cw, ch)
+                ov_view = None
+                # When zoomed into a continent, stream viewport-capped high-res tiles / continent mip on demand
+                if sc_ov > 1.35:
+                    mapped = self._azeroth_overview.overview_px_to_continent_px(
+                        self._overview_pan_x, self._overview_pan_y
+                    )
+                    if mapped is not None:
+                        m_folder, m_cont_slug, cx_cont, cy_cont, cont_per_ov = mapped
+                        sc_cont = sc_ov / max(1e-6, cont_per_ov)
+                        # Tier 3: Full-res CASC tiles for the exact visible viewport when settled
+                        if (
+                            not self._is_interacting
+                            and self.world_maps is not None
+                            and self.world_maps.has_full_res_tiles(m_cont_slug)
+                        ):
+                            ov_view = self.world_maps.render_full_res_viewport(
+                                m_cont_slug, cx_cont, cy_cont, sc_cont, cw, ch
+                            )
+                        # Tier 2: Crisp 1536px continent backdrop during drag/zoom or offline
+                        if ov_view is None:
+                            self._ensure_continent_backdrop(m_folder)
+                            cont_d = self._continent_maps.get(m_folder)
+                            if cont_d is not None:
+                                cont_pil = self._cached_pil_maps.get(f"__cont_{m_folder}")
+                                if cont_pil is None:
+                                    cont_pil = Image.fromarray(cont_d.map_image)
+                                    self._cached_pil_maps[f"__cont_{m_folder}"] = cont_pil
+                                cont_ratio = cont_pil.width / max(1.0, float(cont_d.map_size_px))
+                                cont_mip, c_div = self._get_mip_for_scale(
+                                    f"__cont_{m_folder}", cont_pil, sc_cont / max(1e-5, cont_ratio)
+                                )
+                                sc_c_mip = (sc_cont / max(1e-5, cont_ratio)) * c_div
+                                inv_sc = 1.0 / max(1e-5, sc_c_mip)
+                                tx_c = (cx_cont * cont_ratio / c_div) - (cw * 0.5) * inv_sc
+                                ty_c = (cy_cont * cont_ratio / c_div) - (ch * 0.5) * inv_sc
+                                ov_view = cont_mip.transform(
+                                    (cw, ch),
+                                    Image.Transform.AFFINE,
+                                    (inv_sc, 0.0, tx_c, 0.0, inv_sc, ty_c),
+                                    resample=Image.Resampling.BILINEAR,
+                                    fillcolor=(18, 36, 58),
+                                )
+                if ov_view is None:
+                    inv_s = 1.0 / max(1e-5, sc_ov)
+                    tx = self._overview_pan_x - (cw * 0.5) * inv_s
+                    ty = self._overview_pan_y - (ch * 0.5) * inv_s
+                    ov_view = self._azeroth_overview.image.transform(
+                        (cw, ch),
+                        Image.Transform.AFFINE,
+                        (inv_s, 0.0, tx, 0.0, inv_s, ty),
+                        resample=Image.Resampling.BILINEAR,
+                        fillcolor=(18, 36, 58),
+                    )
+                self._tk_img = ImageTk.PhotoImage(ov_view)
+                self.map_canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
+            else:
+                self.map_canvas.create_text(
+                    cw // 2, ch // 2,
+                    text="Loading Azeroth Overview (Kalimdor & Eastern Kingdoms)...",
+                    fill=TEXT_MUTED,
+                    font=("Segoe UI", 11, "bold"),
+                )
+            if self._transition_state is not None and est is not None:
+                self.lbl_dungeon.config(text=f"Position Fix: {est.dungeon_name} — Zooming in...")
+            elif self.running:
+                self.lbl_dungeon.config(text="Azeroth Overview — Searching for Position Fix...")
+            else:
+                self.lbl_dungeon.config(text="Azeroth Overview — Click 'Start Capture' or select a map")
+            return
 
         if self.view_3d_mode:
             img_3d = self.viewer_3d.render(
@@ -1401,57 +1902,74 @@ class ForeverNavigatorApp:
             self.pan_x, self.pan_y = float(est.map_px[0]), float(est.map_px[1])
 
         sc = self._eff_scale(cw, ch, map_h)
-        inv_s = 1.0 / max(1e-4, sc)
-        tx, ty = self.pan_x - (cw * 0.5) * inv_s, self.pan_y - (ch * 0.5) * inv_s
+        base = self._ensure_fullres_display(slug, d)
+        base_ratio = base.width / float(max(1, map_h))
 
-        base = self._cached_pil_maps.get(slug)
-        if base is None:
-            base = Image.fromarray(d.map_image)
-            self._cached_pil_maps[slug] = base
+        dx0 = int(round((0.0 - self.pan_x) * sc + cw * 0.5))
+        dy0 = int(round((0.0 - self.pan_y) * sc + ch * 0.5))
+        dx1 = int(round((float(map_h) - self.pan_x) * sc + cw * 0.5))
+        dy1 = int(round((float(map_h) - self.pan_y) * sc + ch * 0.5))
+        zone_covers_viewport = (dx0 <= 0 and dy0 <= 0 and dx1 >= cw and dy1 >= ch)
 
         entry = self.world_maps.get_entry(slug) if self.world_maps is not None else None
         folder = entry.minimap_folder if entry is not None else None
+        if folder and entry is not None and entry.category != "Continents":
+            self._ensure_continent_backdrop(folder)
         cont = self._continent_maps.get(folder) if (folder and entry is not None and entry.category != "Continents") else None
-        if cont is not None and d.map_rot90 == 1 and cont.map_rot90 == 1:
+        if cont is not None and d.map_rot90 == 1 and cont.map_rot90 == 1 and not zone_covers_viewport:
             cont_pil = self._cached_pil_maps.get(f"__cont_{folder}")
             if cont_pil is None:
                 cont_pil = Image.fromarray(cont.map_image)
                 self._cached_pil_maps[f"__cont_{folder}"] = cont_pil
+            # Lightweight continent complement (stays low-RAM; never decodes full-res CASC tiles for surrounding zones)
             wx_c, wy_c = d.map_px_to_world(self.pan_x, self.pan_y)
-            ch_cont = float(cont.map_image.shape[0])
+            ch_cont = float(cont.map_size_px)
             cx_cont = (ch_cont - 1.0) - (wy_c - float(cont.map_origin_xy[1])) * cont.map_scale
             cy_cont = (ch_cont - 1.0) - (wx_c - float(cont.map_origin_xy[0])) * cont.map_scale
             sc_cont = sc * (d.map_scale / max(1e-6, cont.map_scale))
-            inv_s_cont = 1.0 / max(1e-5, sc_cont)
-            tx_cont = cx_cont - (cw * 0.5) * inv_s_cont
-            ty_cont = cy_cont - (ch * 0.5) * inv_s_cont
-            view_img = cont_pil.transform(
+            cont_ratio = cont_pil.width / max(1.0, ch_cont)
+            cont_mip, c_div = self._get_mip_for_scale(f"__cont_{folder}", cont_pil, sc_cont / max(1e-5, cont_ratio))
+            sc_c_mip = (sc_cont / max(1e-5, cont_ratio)) * c_div
+            inv_s_cont = 1.0 / max(1e-5, sc_c_mip)
+            tx_cont = (cx_cont * cont_ratio / c_div) - (cw * 0.5) * inv_s_cont
+            ty_cont = (cy_cont * cont_ratio / c_div) - (ch * 0.5) * inv_s_cont
+            view_img = cont_mip.transform(
                 (cw, ch),
                 Image.Transform.AFFINE,
                 (inv_s_cont, 0.0, tx_cont, 0.0, inv_s_cont, ty_cont),
                 resample=Image.Resampling.BILINEAR,
                 fillcolor=(22, 46, 72),
             )
-            # Composite crisp active zone tile on top of the seamless continent backdrop
-            dx0 = int(round((0.0 - self.pan_x) * sc + cw * 0.5))
-            dy0 = int(round((0.0 - self.pan_y) * sc + ch * 0.5))
-            dx1 = int(round((float(d.map_image.shape[1]) - self.pan_x) * sc + cw * 0.5))
-            dy1 = int(round((float(d.map_image.shape[0]) - self.pan_y) * sc + ch * 0.5))
+            # Composite crisp active zone tile on top of the seamless continent backdrop (viewport-capped LOD mip)
             zw, zh = dx1 - dx0, dy1 - dy0
             if zw >= 4 and zh >= 4 and dx1 > 0 and dy1 > 0 and dx0 < cw and dy0 < ch:
                 sx0 = max(0, dx0)
                 sy0 = max(0, dy0)
                 sx1 = min(cw, dx1)
                 sy1 = min(ch, dy1)
-                u0 = max(0.0, (sx0 - dx0) / float(zw) * d.map_image.shape[1])
-                v0 = max(0.0, (sy0 - dy0) / float(zh) * d.map_image.shape[0])
-                u1 = min(float(d.map_image.shape[1]), (sx1 - dx0) / float(zw) * d.map_image.shape[1])
-                v1 = min(float(d.map_image.shape[0]), (sy1 - dy0) / float(zh) * d.map_image.shape[0])
+                zone_mip, _z_div = self._get_mip_for_scale(slug, base, sc / max(1e-5, base_ratio))
+                u0 = max(0.0, (sx0 - dx0) / float(zw) * zone_mip.width)
+                v0 = max(0.0, (sy0 - dy0) / float(zh) * zone_mip.height)
+                u1 = min(float(zone_mip.width), (sx1 - dx0) / float(zw) * zone_mip.width)
+                v1 = min(float(zone_mip.height), (sy1 - dy0) / float(zh) * zone_mip.height)
                 if sx1 > sx0 and sy1 > sy0 and u1 > u0 and v1 > v0:
-                    zone_patch = base.crop((u0, v0, u1, v1)).resize((sx1 - sx0, sy1 - sy0), Image.Resampling.BILINEAR)
+                    zone_patch = zone_mip.crop((u0, v0, u1, v1)).resize((sx1 - sx0, sy1 - sy0), Image.Resampling.BILINEAR)
                     view_img.paste(zone_patch, (sx0, sy0))
         else:
-            view_img = base.transform((cw, ch), Image.Transform.AFFINE, (inv_s, 0.0, tx, 0.0, inv_s, ty), resample=Image.Resampling.BILINEAR, fillcolor=(13, 17, 23))
+            view_img = None
+            if (
+                not self._is_interacting
+                and sc > 1.05
+                and self.world_maps is not None
+                and self.world_maps.has_full_res_tiles(slug)
+            ):
+                view_img = self.world_maps.render_full_res_viewport(slug, self.pan_x, self.pan_y, sc, cw, ch)
+            if view_img is None:
+                mip_im, m_div = self._get_mip_for_scale(slug, base, sc / max(1e-5, base_ratio))
+                inv_s_m = 1.0 / max(1e-5, (sc / max(1e-5, base_ratio)) * m_div)
+                tx_m = (self.pan_x * base_ratio / m_div) - (cw * 0.5) * inv_s_m
+                ty_m = (self.pan_y * base_ratio / m_div) - (ch * 0.5) * inv_s_m
+                view_img = mip_im.transform((cw, ch), Image.Transform.AFFINE, (inv_s_m, 0.0, tx_m, 0.0, inv_s_m, ty_m), resample=Image.Resampling.BILINEAR, fillcolor=(13, 17, 23))
         self._tk_img = ImageTk.PhotoImage(view_img)
         self.map_canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
 
@@ -1524,9 +2042,25 @@ class ForeverNavigatorApp:
     def _on_close(self) -> None:
         self._closing = True
         self.running = False
+        self._stop_capture_event.set()
+        self._cancel_fix_transition()
+        for attr in ("_poll_after_id", "_render_after_id", "_settle_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        if self._azeroth_overview is not None:
+            self._azeroth_overview.close()
+            self._azeroth_overview = None
         self.stop_network()
         self.dev_logger.close()
         self.session_store.close()
+        self.tracker_mm.close()
+        if self.world_maps is not None and hasattr(self.world_maps, "close"):
+            self.world_maps.close()
         self.viewer_3d.close()
         self.root.destroy()
 

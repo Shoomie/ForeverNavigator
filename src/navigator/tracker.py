@@ -28,9 +28,16 @@ class DungeonData:
     view_wp_idx: np.ndarray      # (V,) int32
     wp_to_views: List[np.ndarray]
     map_rot90: int = 0           # 1 = 90 CCW, 3 = 90 CW (exact WoW North-Up WMO minimap)
+    bounds_xy: Optional[Tuple[float, float, float, float]] = None  # (xmin, ymin, xmax, ymax)
+    native_map_px: int = 0       # Full native pixel dimension when map_image holds a low-RAM preview
+    map_full_path: Optional[Path] = None  # On-disk full-res PNG/NPZ for dynamic SSD/HDD streaming
+
+    @property
+    def map_size_px(self) -> int:
+        return self.native_map_px if self.native_map_px > 0 else int(self.map_image.shape[0])
 
     def world_to_map_px(self, xy: np.ndarray) -> Tuple[int, int]:
-        h = self.map_image.shape[0]
+        h = self.map_size_px
         px_raw = (float(xy[0]) - float(self.map_origin_xy[0])) * self.map_scale
         py_raw = (h - 1) - (float(xy[1]) - float(self.map_origin_xy[1])) * self.map_scale
         if self.map_rot90 == 1:
@@ -42,7 +49,7 @@ class DungeonData:
         return int(round(px)), int(round(py))
 
     def map_px_to_world(self, px: float, py: float) -> Tuple[float, float]:
-        h = self.map_image.shape[0]
+        h = self.map_size_px
         if self.map_rot90 == 1:
             px_raw, py_raw = (h - 1) - float(py), float(px)
         elif self.map_rot90 == 3:
@@ -65,6 +72,8 @@ class TrackerEstimate:
     particles_px: List[Tuple[int, int]]
     inference_ms: float
     all_dungeon_scores: Dict[str, float]
+    is_shared_minimap: bool = False
+    outdoor_context_slug: Optional[str] = None
 
 
 class AdaptiveUIMasker:
@@ -141,47 +150,68 @@ class CombatLogWatcher:
         return self.last_zone_hint
 
 
-def load_dungeon_npz(npz_path: Path) -> DungeonData:
-    """Load a DungeonData object from a pre-indexed or cached .npz file."""
-    z = np.load(npz_path, allow_pickle=False)
-    waypoints = z["waypoints"].astype(np.float32) if "waypoints" in z else np.zeros((1, 3), dtype=np.float32)
-    n_wp = max(1, len(waypoints))
+def load_dungeon_npz(npz_path: Path, max_preview_px: Optional[int] = None) -> DungeonData:
+    """Load a DungeonData object from a pre-indexed or cached .npz file.
 
-    adj: List[List[int]] = [[] for _ in range(n_wp)]
-    if "edges_src" in z and "edges_dst" in z:
-        edges_src = z["edges_src"].astype(np.int32)
-        edges_dst = z["edges_dst"].astype(np.int32)
-        for u, v in zip(edges_src.tolist(), edges_dst.tolist()):
-            adj[u].append(v)
+    When `max_preview_px` is set and the stored image is larger, downscales `map_image` in RAM
+    to a lightweight preview while preserving `native_map_px` and `map_full_path` for on-demand streaming.
+    """
+    npz_path = Path(npz_path)
+    with np.load(npz_path, allow_pickle=False) as z:
+        waypoints = z["waypoints"].astype(np.float32) if "waypoints" in z else np.zeros((1, 3), dtype=np.float32)
+        n_wp = max(1, len(waypoints))
 
-    if "embeddings_i8" in z:
-        embs = z["embeddings_i8"].astype(np.float32) / 127.0
-        if len(embs) > 0:
-            embs /= np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
-    else:
-        embs = np.zeros((0, 1), dtype=np.float32)
+        adj: List[List[int]] = [[] for _ in range(n_wp)]
+        if "edges_src" in z and "edges_dst" in z:
+            edges_src = z["edges_src"].astype(np.int32)
+            edges_dst = z["edges_dst"].astype(np.int32)
+            for u, v in zip(edges_src.tolist(), edges_dst.tolist()):
+                adj[u].append(v)
 
-    view_wp_idx = z["view_wp_idx"].astype(np.int32) if "view_wp_idx" in z else np.zeros((0,), dtype=np.int32)
-    wp_to_views: List[List[int]] = [[] for _ in range(n_wp)]
-    for vi, wi in enumerate(view_wp_idx.tolist()):
-        if 0 <= wi < n_wp:
-            wp_to_views[wi].append(vi)
+        if "embeddings_i8" in z:
+            embs = z["embeddings_i8"].astype(np.float32) / 127.0
+            if len(embs) > 0:
+                embs /= np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
+        else:
+            embs = np.zeros((0, 1), dtype=np.float32)
 
-    kw_raw = z["combatlog_keywords"].tolist() if "combatlog_keywords" in z else []
-    return DungeonData(
-        slug=str(z["slug"]),
-        name=str(z["name"]),
-        combatlog_keywords=[str(k) for k in kw_raw],
-        waypoints=waypoints,
-        adjacency=adj,
-        map_image=z["map_image"].astype(np.uint8),
-        map_origin_xy=z["map_origin_xy"].astype(np.float32),
-        map_scale=float(z["map_scale"]),
-        embeddings_f32=embs,
-        view_wp_idx=view_wp_idx,
-        wp_to_views=[np.array(v, dtype=np.int32) for v in wp_to_views],
-        map_rot90=int(z["map_rot90"]) if "map_rot90" in z else 0,
-    )
+        view_wp_idx = z["view_wp_idx"].astype(np.int32) if "view_wp_idx" in z else np.zeros((0,), dtype=np.int32)
+        wp_to_views: List[List[int]] = [[] for _ in range(n_wp)]
+        for vi, wi in enumerate(view_wp_idx.tolist()):
+            if 0 <= wi < n_wp:
+                wp_to_views[wi].append(vi)
+
+        kw_raw = z["combatlog_keywords"].tolist() if "combatlog_keywords" in z else []
+        b_xy: Optional[Tuple[float, float, float, float]] = None
+        if "bounds_xy" in z:
+            arr_b = z["bounds_xy"]
+            if len(arr_b) == 4 and np.all(np.isfinite(arr_b)):
+                b_xy = (float(arr_b[0]), float(arr_b[1]), float(arr_b[2]), float(arr_b[3]))
+
+        map_img = z["map_image"].astype(np.uint8)
+        native_px = int(map_img.shape[0])
+        png_sibling = npz_path.with_suffix(".png")
+        full_path = png_sibling if png_sibling.exists() else npz_path
+        if max_preview_px is not None and native_px > max_preview_px:
+            map_img = cv2.resize(map_img, (max_preview_px, max_preview_px), interpolation=cv2.INTER_AREA)
+
+        return DungeonData(
+            slug=str(z["slug"]),
+            name=str(z["name"]),
+            combatlog_keywords=[str(k) for k in kw_raw],
+            waypoints=waypoints,
+            adjacency=adj,
+            map_image=map_img,
+            map_origin_xy=z["map_origin_xy"].astype(np.float32),
+            map_scale=float(z["map_scale"]),
+            embeddings_f32=embs,
+            view_wp_idx=view_wp_idx,
+            wp_to_views=[np.array(v, dtype=np.int32) for v in wp_to_views],
+            map_rot90=int(z["map_rot90"]) if "map_rot90" in z else 0,
+            bounds_xy=b_xy,
+            native_map_px=native_px,
+            map_full_path=full_path,
+        )
 
 
 class MultiDungeonTracker:
