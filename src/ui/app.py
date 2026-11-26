@@ -74,7 +74,7 @@ from ..navigator.settings import (
     save_settings,
 )
 from ..navigator.spawns import get_spawns_for_dungeon
-from ..navigator.tracker import MultiDungeonTracker, TrackerEstimate
+from ..navigator.tracker import LightweightDungeonStore, TrackerEstimate
 from ..net.client import ForeverNavigatorClient
 from ..net.protocol import (
     WOW_CLASS_COLORS,
@@ -387,13 +387,14 @@ class ForeverNavigatorApp:
         self.wow_dir = find_wow_dir(self.settings.wow_dir or None)
         self.wow_logs_dir = (self.wow_dir / "_forever_" / "Logs") if self.wow_dir else None
 
-        self.tracker_3d = MultiDungeonTracker(index_dir, wow_logs_dir=self.wow_logs_dir)
+        self.tracker_3d = LightweightDungeonStore(index_dir, max_preview_px=512)
         self.tracker_mm = MinimapTracker(
             dungeons=self.tracker_3d.dungeons,
             dungeon_order=self.tracker_3d.dungeon_order,
             roi=load_roi(self.roi_path),
             rotate_minimap=self.settings.rotate_minimap,
             high_precision=self.settings.high_precision,
+            lazy_precompute=True,
         )
         self.viewer_3d = GPU3DViewer(wow_dir=self.wow_dir, listfile_path=self.data_dir / "listfile.csv", product="wowf")
         try:
@@ -449,16 +450,27 @@ class ForeverNavigatorApp:
         self._rdrag_last = None
         self._cached_pil_maps: OrderedDict[str, Image.Image] = OrderedDict()
         self._cached_mips: dict[str, list[tuple[int, Image.Image]]] = {}
+        self._cached_np_mips: dict[str, list[tuple[int, np.ndarray]]] = {}
         self._streaming_slugs: set[str] = set()
         self._continent_maps: dict[str, Any] = {}
         self._continent_loading: set[str] = set()
+        self._cont_l1_cache: dict[str, tuple[np.ndarray, int]] = {}
+        self._cont_l1_loading: set[str] = set()
+        self._deep_tile_view: Optional[tuple[tuple, Image.Image]] = None
+        self._deep_tile_req_id: int = 0
         self._showing_azeroth_overview: bool = True
         self._azeroth_overview: Optional[Any] = None
+        self._azeroth_overview_arr: Optional[np.ndarray] = None
         self._overview_zoom: float = 1.0
-        self._overview_pan_x: float = 800.0
-        self._overview_pan_y: float = 450.0
+        self._overview_pan_x: float = 1920.0
+        self._overview_pan_y: float = 1080.0
         self._transition_after_id: Optional[str] = None
         self._transition_state: Optional[dict[str, Any]] = None
+        self._zoom_target: Optional[float] = None
+        self._zoom_anchor: Optional[tuple[float, float]] = None
+        self._zoom_anim_id: Optional[str] = None
+        self._last_pills_sig: Optional[tuple] = None
+        self._last_dungeon_lbl: str = ""
         self.view_3d_mode = False
 
         self.root = tk.Tk()
@@ -773,7 +785,7 @@ class ForeverNavigatorApp:
         self.map_canvas = tk.Canvas(viewport, bg=BG_APP, highlightthickness=0, cursor="crosshair")
         self.map_canvas.pack(fill=tk.BOTH, expand=True)
         self.map_canvas.bind("<Configure>", lambda _e: self._schedule_render(interacting=True))
-        self.map_canvas.bind("<MouseWheel>", lambda e: self._adjust_zoom(1.18 if e.delta > 0 else 1 / 1.18))
+        self.map_canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.map_canvas.bind("<ButtonPress-1>", self._on_lpress)
         self.map_canvas.bind("<B1-Motion>", self._on_ldrag)
         self.map_canvas.bind("<ButtonRelease-1>", self._on_lrelease)
@@ -957,12 +969,32 @@ class ForeverNavigatorApp:
                     if self._azeroth_overview is not None:
                         self._azeroth_overview.close()
                     self._cached_mips.pop("__azeroth_ov", None)
+                    self._cached_np_mips.pop("__azeroth_ov", None)
                     self._azeroth_overview = ov
+                    self._azeroth_overview_arr = np.asarray(ov.image, dtype=np.uint8)
                     self._overview_pan_x = ov.width * 0.5
                     self._overview_pan_y = ov.height * 0.5
                     self._overview_zoom = 1.0
                     if self._showing_azeroth_overview:
                         needs_render = True
+            elif kind == "cont_l1_loaded":
+                cont_slug, res = payload
+                self._cont_l1_loading.discard(cont_slug)
+                if res is not None:
+                    # Keep only 1 Level-1 4096px continent array in RAM at a time
+                    for old_s in list(self._cont_l1_cache.keys()):
+                        if old_s != cont_slug:
+                            self._cont_l1_cache.pop(old_s, None)
+                            self._cached_np_mips.pop(f"__l1_{old_s}", None)
+                    self._cont_l1_cache[cont_slug] = res
+                    self._cached_np_mips.pop(f"__l1_{cont_slug}", None)
+                    if self._showing_azeroth_overview:
+                        needs_render = True
+            elif kind == "deep_tile_ready":
+                req_id, key, vp_img = payload
+                if req_id == self._deep_tile_req_id and vp_img is not None and not self._is_interacting:
+                    self._deep_tile_view = (key, vp_img)
+                    needs_render = True
             elif kind == "map_cached_register":
                 slug, dungeon = payload
                 if dungeon is not None and slug not in self.tracker_3d.dungeons:
@@ -995,6 +1027,7 @@ class ForeverNavigatorApp:
                     self.dungeon_var.set(dungeon.name)
                     self._latest_est = None
                     self._cancel_fix_transition()
+                    self._cancel_smooth_zoom()
                     self._showing_azeroth_overview = False
                     entry = self.world_maps.get_entry(slug) if self.world_maps is not None else None
                     if entry is not None and entry.is_shared:
@@ -1082,6 +1115,9 @@ class ForeverNavigatorApp:
 
         if self._showing_azeroth_overview:
             self._cancel_fix_transition()
+            self._cancel_smooth_zoom()
+            self._cancel_smooth_zoom()
+            self._deep_tile_view = None
             if self._azeroth_overview is not None:
                 cw, ch = max(1, self.map_canvas.winfo_width()), max(1, self.map_canvas.winfo_height())
                 sc_ov = self._overview_eff_scale(cw, ch)
@@ -1203,6 +1239,7 @@ class ForeverNavigatorApp:
         self.tracker_mm.locked_dungeon_slug = None
         self._latest_est = None
         self._cancel_fix_transition()
+        self._cancel_smooth_zoom()
         self._showing_azeroth_overview = True
         self._overview_zoom = 1.0
         if self._azeroth_overview is not None:
@@ -1252,6 +1289,7 @@ class ForeverNavigatorApp:
     def _start_fix_transition(self, est: TrackerEstimate) -> None:
         """Smoothly zoom from the Azeroth overview directly into the player's detected zone & position."""
         self._cancel_fix_transition()
+        self._cancel_smooth_zoom()
         d = self.tracker_3d.dungeons.get(est.dungeon_slug)
         if d is None:
             self._showing_azeroth_overview = False
@@ -1348,6 +1386,8 @@ class ForeverNavigatorApp:
     def _evict_cache_key(self, key: str) -> None:
         im = self._cached_pil_maps.pop(key, None)
         mips = self._cached_mips.pop(key, None)
+        if hasattr(self, "_cached_np_mips"):
+            self._cached_np_mips.pop(key, None)
         if mips:
             for _div, mip_im in mips:
                 if mip_im is not im:
@@ -1360,6 +1400,92 @@ class ForeverNavigatorApp:
                 im.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _warp_view_cv2(
+        arr_rgb: np.ndarray,
+        pan_x: float,
+        pan_y: float,
+        scale: float,
+        cw: int,
+        ch: int,
+        fillcolor: tuple[int, int, int],
+    ) -> Image.Image:
+        """Ultra-fast AVX2 C++ viewport affine blit (~3-4 ms at 1200x800 vs ~22 ms in PIL)."""
+        tx = cw * 0.5 - pan_x * scale
+        ty = ch * 0.5 - pan_y * scale
+        m = np.array([[scale, 0.0, tx], [0.0, scale, ty]], dtype=np.float32)
+        out = cv2.warpAffine(
+            arr_rgb,
+            m,
+            (cw, ch),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=fillcolor,
+        )
+        return Image.fromarray(out)
+
+    def _get_np_mip_for_scale(
+        self, key: str, full_arr: np.ndarray, target_scale: float
+    ) -> tuple[np.ndarray, int]:
+        """Return (np_mip_array, divisor) capped to viewport resolution for 60 FPS OpenCV blits."""
+        mips = self._cached_np_mips.get(key)
+        if mips is None or mips[0][1] is not full_arr:
+            mips = [(1, full_arr)]
+            cur = full_arr
+            div = 1
+            while min(cur.shape[0], cur.shape[1]) > 768 and div < 16:
+                nw = max(256, cur.shape[1] // 2)
+                nh = max(256, cur.shape[0] // 2)
+                cur = cv2.resize(cur, (nw, nh), interpolation=cv2.INTER_AREA)
+                div *= 2
+                mips.append((div, cur))
+            self._cached_np_mips[key] = mips
+
+        chosen_div, chosen_arr = mips[0]
+        for div, arr in mips:
+            if target_scale * div <= 1.05:
+                chosen_div, chosen_arr = div, arr
+            else:
+                break
+        return chosen_arr, chosen_div
+
+    def _ensure_continent_l1_async(self, cont_slug: str) -> None:
+        if self.world_maps is None or cont_slug in self._cont_l1_cache or cont_slug in self._cont_l1_loading:
+            return
+        self._cont_l1_loading.add(cont_slug)
+
+        def _worker(slug: str = cont_slug) -> None:
+            res = None
+            try:
+                res = self.world_maps.load_continent_l1_array(slug, max_px=4096)
+            except Exception:
+                res = None
+            if not self._closing:
+                self._ui_queue.put(("cont_l1_loaded", (slug, res)))
+
+        threading.Thread(target=_worker, daemon=True, name=f"LoadL1-{cont_slug}").start()
+
+    def _request_deep_tiles_async(
+        self, cont_slug: str, cx_cont: float, cy_cont: float, sc_cont: float, cw: int, ch: int
+    ) -> None:
+        key = (cont_slug, int(round(cx_cont)), int(round(cy_cont)), round(sc_cont, 3), cw, ch)
+        if self._deep_tile_view is not None and self._deep_tile_view[0] == key:
+            return
+        self._deep_tile_req_id += 1
+        req_id = self._deep_tile_req_id
+
+        def _worker() -> None:
+            vp = None
+            try:
+                if self.world_maps is not None and self.world_maps.ensure_full_res_tiles(cont_slug):
+                    vp = self.world_maps.render_full_res_viewport(cont_slug, cx_cont, cy_cont, sc_cont, cw, ch)
+            except Exception:
+                vp = None
+            if not self._closing:
+                self._ui_queue.put(("deep_tile_ready", (req_id, key, vp)))
+
+        threading.Thread(target=_worker, daemon=True, name=f"DeepTile-{req_id}").start()
 
     def _trim_display_cache(self, keep_slug: Optional[str] = None) -> None:
         limit = self._display_cache_limit()
@@ -1439,6 +1565,7 @@ class ForeverNavigatorApp:
             self.dungeon_var.set(entry.name)
             self._latest_est = None
             self._cancel_fix_transition()
+            self._cancel_smooth_zoom()
             self._showing_azeroth_overview = False
             self.lbl_map_status.config(text=f"Active: {entry.name}")
             self._reset_view()
@@ -1542,20 +1669,33 @@ class ForeverNavigatorApp:
     def _update_live_pills(self, est: Optional[TrackerEstimate]) -> None:
         if self.server and self.server.is_running:
             cnt = getattr(self.server, "connected_count", 0)
-            self.pill_sync.config(text=f"Host :{self.server.config.port} ({cnt})", fg="#3fb950")
+            sync_txt, sync_fg = f"Host :{self.server.config.port} ({cnt})", "#3fb950"
         elif self.client:
             if getattr(self.client, "connected", False):
-                self.pill_sync.config(text=f"Synced ({self.client.clock_offset_ms}ms)", fg="#3fb950")
+                sync_txt, sync_fg = f"Synced ({self.client.clock_offset_ms}ms)", "#3fb950"
             else:
-                self.pill_sync.config(text="Connecting...", fg=ACCENT_GOLD)
+                sync_txt, sync_fg = "Connecting...", ACCENT_GOLD
         else:
-            self.pill_sync.config(text="Offline Solo", fg=ACCENT_BLUE)
+            sync_txt, sync_fg = "Offline Solo", ACCENT_BLUE
 
         if est is not None:
-            self.pill_pos.config(text=f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%", fg=TEXT_PRIMARY)
+            pos_txt, pos_fg = f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%", TEXT_PRIMARY
         else:
-            self.pill_pos.config(text="Pos: --", fg=TEXT_MUTED)
-        self.pill_fps.config(text=f"{self.fps:.1f} Hz")
+            pos_txt, pos_fg = "Pos: --", TEXT_MUTED
+        fps_txt = f"{self.fps:.1f} Hz"
+
+        sig = (sync_txt, sync_fg, pos_txt, pos_fg, fps_txt)
+        if sig == self._last_pills_sig:
+            return
+        self._last_pills_sig = sig
+        self.pill_sync.config(text=sync_txt, fg=sync_fg)
+        self.pill_pos.config(text=pos_txt, fg=pos_fg)
+        self.pill_fps.config(text=fps_txt)
+
+    def _set_dungeon_label(self, text: str) -> None:
+        if text != self._last_dungeon_lbl:
+            self._last_dungeon_lbl = text
+            self.lbl_dungeon.config(text=text)
 
     def _refresh_roster(self, shown_players: Dict[str, PlayerState]) -> None:
         if not hasattr(self, "roster_tree"):
@@ -1602,12 +1742,109 @@ class ForeverNavigatorApp:
         self._is_interacting = False
         self._render_current_map(self._latest_est, self._latest_mm_crop)
 
+    def _cancel_smooth_zoom(self) -> None:
+        if self._zoom_anim_id is not None:
+            try:
+                self.root.after_cancel(self._zoom_anim_id)
+            except Exception:
+                pass
+            self._zoom_anim_id = None
+        self._zoom_target = None
+        self._zoom_anchor = None
+
+    def _on_mousewheel(self, event) -> None:
+        """Smooth, cursor-anchored zoom supporting both stepped clicks and free-rolling wheels."""
+        if self._closing:
+            return
+        delta = float(getattr(event, "delta", 0))
+        if abs(delta) < 1e-3:
+            return
+        # Proportional to wheel delta (free-rolling wheels send small deltas; standard clicks send +/-120)
+        factor = 1.24 ** (delta / 120.0)
+        self._cancel_fix_transition()
+        self._deep_tile_view = None
+        if self.view_3d_mode:
+            base_z = self._zoom_target if self._zoom_target is not None else self.viewer_3d.zoom
+            self._zoom_target = float(np.clip(base_z * factor, 0.4, 6.0))
+        elif self._showing_azeroth_overview:
+            base_z = self._zoom_target if self._zoom_target is not None else self._overview_zoom
+            self._zoom_target = float(np.clip(base_z * factor, 0.5, 64.0))
+        else:
+            base_z = self._zoom_target if self._zoom_target is not None else self.zoom
+            self._zoom_target = float(np.clip(base_z * factor, 0.10, 8.0))
+        self._zoom_anchor = (float(event.x), float(event.y))
+        self._is_interacting = True
+        if self._settle_after_id is not None:
+            try:
+                self.root.after_cancel(self._settle_after_id)
+            except Exception:
+                pass
+            self._settle_after_id = None
+        if self._zoom_anim_id is None:
+            self._zoom_anim_id = self.root.after(10, self._step_smooth_zoom)
+
+    def _step_smooth_zoom(self) -> None:
+        self._zoom_anim_id = None
+        if self._closing or self._zoom_target is None:
+            return
+        cw = max(1, self.map_canvas.winfo_width())
+        ch = max(1, self.map_canvas.winfo_height())
+        ax, ay = self._zoom_anchor if self._zoom_anchor is not None else (cw * 0.5, ch * 0.5)
+        target = self._zoom_target
+
+        if self.view_3d_mode:
+            cur = self.viewer_3d.zoom
+            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.005 else cur * ((target / cur) ** 0.34)
+            self.viewer_3d.zoom = nxt
+            self.lbl_zoom.config(text=f"{int(round(nxt * 100))}%")
+            done = (nxt == target)
+        elif self._showing_azeroth_overview:
+            cur = self._overview_zoom
+            old_sc = self._overview_eff_scale(cw, ch)
+            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.004 else cur * ((target / cur) ** 0.34)
+            self._overview_zoom = nxt
+            new_sc = self._overview_eff_scale(cw, ch)
+            # Keep the world point under cursor (ax, ay) pinned while zooming
+            if self._azeroth_overview is not None and old_sc > 1e-6 and new_sc > 1e-6:
+                wx_a = self._overview_pan_x + (ax - cw * 0.5) / old_sc
+                wy_a = self._overview_pan_y + (ay - ch * 0.5) / old_sc
+                self._overview_pan_x = float(np.clip(wx_a - (ax - cw * 0.5) / new_sc, 0, self._azeroth_overview.width))
+                self._overview_pan_y = float(np.clip(wy_a - (ay - ch * 0.5) / new_sc, 0, self._azeroth_overview.height))
+            self.lbl_zoom.config(text=f"{int(round(nxt * 100))}%")
+            done = (nxt == target)
+        else:
+            d = self.tracker_3d.dungeons[self._active_slug()]
+            map_h = d.map_size_px
+            cur = self.zoom
+            old_sc = self._eff_scale(cw, ch, map_h)
+            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.004 else cur * ((target / cur) ** 0.34)
+            self.zoom = nxt
+            new_sc = self._eff_scale(cw, ch, map_h)
+            if not self.follow_var.get() and old_sc > 1e-6 and new_sc > 1e-6:
+                mx_a = self.pan_x + (ax - cw * 0.5) / old_sc
+                my_a = self.pan_y + (ay - ch * 0.5) / old_sc
+                self.pan_x = float(np.clip(mx_a - (ax - cw * 0.5) / new_sc, 0, map_h))
+                self.pan_y = float(np.clip(my_a - (ay - ch * 0.5) / new_sc, 0, map_h))
+            self.lbl_zoom.config(text=f"{int(round(nxt * 100))}%")
+            done = (nxt == target)
+
+        self._render_current_map(self._latest_est, self._latest_mm_crop)
+        if not done:
+            self._zoom_anim_id = self.root.after(16, self._step_smooth_zoom)
+        else:
+            self._zoom_target = None
+            self._zoom_anchor = None
+            self._settle_after_id = self.root.after(90, self._on_interaction_settled)
+
     def _adjust_zoom(self, factor: float) -> None:
+        self._cancel_smooth_zoom()
+        self._deep_tile_view = None
         if self.view_3d_mode:
             self.viewer_3d.zoom = float(np.clip(self.viewer_3d.zoom * factor, 0.4, 6.0))
             self.lbl_zoom.config(text=f"{int(round(self.viewer_3d.zoom * 100))}%")
         elif self._showing_azeroth_overview:
             self._cancel_fix_transition()
+            self._cancel_smooth_zoom()
             self._overview_zoom = float(np.clip(self._overview_zoom * factor, 0.5, 64.0))
             self.lbl_zoom.config(text=f"{int(round(self._overview_zoom * 100))}%")
         else:
@@ -1808,36 +2045,67 @@ class ForeverNavigatorApp:
         self._update_live_pills(est)
         self._refresh_roster(shown_players)
 
-        # Startup / pre-fix 4K Azeroth Overview (Kalimdor + Eastern Kingdoms, viewport-capped with deep full-res zoom)
+        # Startup / pre-fix 4K Azeroth Overview (3-level prestitched pyramid: 4K World -> 4K Continent L1 -> Async Native Tiles)
         if self._showing_azeroth_overview and not self.view_3d_mode and not self.replay_mode:
             if self._azeroth_overview is not None:
                 sc_ov = self._overview_eff_scale(cw, ch)
                 ov_view = None
-                # Only stream native 512px CASC tiles when deeply zoomed (sc_cont >= 1.20 -> <= ~12 visible tiles)
-                if not self._is_interacting and sc_ov > 1.15 and self.world_maps is not None:
+                if sc_ov > 1.15 and self.world_maps is not None:
                     mapped = self._azeroth_overview.overview_px_to_continent_px(
                         self._overview_pan_x, self._overview_pan_y
                     )
                     if mapped is not None:
                         _m_folder, m_cont_slug, cx_cont, cy_cont, cont_per_ov = mapped
                         sc_cont = sc_ov / max(1e-6, cont_per_ov)
-                        if sc_cont >= 1.20 and self.world_maps.ensure_full_res_tiles(m_cont_slug):
-                            ov_view = self.world_maps.render_full_res_viewport(
-                                m_cont_slug, cx_cont, cy_cont, sc_cont, cw, ch
-                            )
-                # Baseline 4K precached overview with mip pyramid (zero SSD reads during pan/zoom 1x..5x!)
+                        # Level 2: Async native 512px CASC tiles when deeply zoomed & settled (zero UI stall)
+                        if not self._is_interacting and sc_cont >= 1.65:
+                            tile_key = (m_cont_slug, int(round(cx_cont)), int(round(cy_cont)), round(sc_cont, 3), cw, ch)
+                            if self._deep_tile_view is not None and self._deep_tile_view[0] == tile_key:
+                                ov_view = self._deep_tile_view[1]
+                            else:
+                                self._request_deep_tiles_async(m_cont_slug, cx_cont, cy_cont, sc_cont, cw, ch)
+                        # Level 1: Prestitched 4096x4096 WoW: Forever continent JPEG (4 ms/frame cv2 blit, zero CASC I/O)
+                        if ov_view is None:
+                            self._ensure_continent_l1_async(m_cont_slug)
+                            l1_entry = self._cont_l1_cache.get(m_cont_slug)
+                            if l1_entry is not None:
+                                l1_arr, l1_native_px = l1_entry
+                                l1_ratio = l1_arr.shape[0] / max(1.0, float(l1_native_px))
+                                sc_l1 = sc_cont / max(1e-5, l1_ratio)
+                                mip_arr, m_div = self._get_np_mip_for_scale(f"__l1_{m_cont_slug}", l1_arr, sc_l1)
+                                ov_view = self._warp_view_cv2(
+                                    mip_arr,
+                                    (cx_cont * l1_ratio) / m_div,
+                                    (cy_cont * l1_ratio) / m_div,
+                                    sc_l1 * m_div,
+                                    cw,
+                                    ch,
+                                    (18, 36, 58),
+                                )
+                # Level 0: Precached 4K Azeroth overview with fast OpenCV mip pyramid (~3-4 ms/frame!)
                 if ov_view is None:
-                    ov_mip, ov_div = self._get_mip_for_scale("__azeroth_ov", self._azeroth_overview.image, sc_ov)
-                    inv_s = 1.0 / max(1e-5, sc_ov * ov_div)
-                    tx = (self._overview_pan_x / ov_div) - (cw * 0.5) * inv_s
-                    ty = (self._overview_pan_y / ov_div) - (ch * 0.5) * inv_s
-                    ov_view = ov_mip.transform(
-                        (cw, ch),
-                        Image.Transform.AFFINE,
-                        (inv_s, 0.0, tx, 0.0, inv_s, ty),
-                        resample=Image.Resampling.BILINEAR,
-                        fillcolor=(18, 36, 58),
-                    )
+                    if self._azeroth_overview_arr is not None:
+                        mip_arr, ov_div = self._get_np_mip_for_scale("__azeroth_ov", self._azeroth_overview_arr, sc_ov)
+                        ov_view = self._warp_view_cv2(
+                            mip_arr,
+                            self._overview_pan_x / ov_div,
+                            self._overview_pan_y / ov_div,
+                            sc_ov * ov_div,
+                            cw,
+                            ch,
+                            (18, 36, 58),
+                        )
+                    else:
+                        inv_s = 1.0 / max(1e-5, sc_ov)
+                        tx = self._overview_pan_x - (cw * 0.5) * inv_s
+                        ty = self._overview_pan_y - (ch * 0.5) * inv_s
+                        ov_view = self._azeroth_overview.image.transform(
+                            (cw, ch),
+                            Image.Transform.AFFINE,
+                            (inv_s, 0.0, tx, 0.0, inv_s, ty),
+                            resample=Image.Resampling.BILINEAR,
+                            fillcolor=(18, 36, 58),
+                        )
                 self._tk_img = ImageTk.PhotoImage(ov_view)
                 self.map_canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
             else:
@@ -1848,11 +2116,11 @@ class ForeverNavigatorApp:
                     font=("Segoe UI", 11, "bold"),
                 )
             if self._transition_state is not None and est is not None:
-                self.lbl_dungeon.config(text=f"Position Fix: {est.dungeon_name} — Zooming in...")
+                self._set_dungeon_label(f"Position Fix: {est.dungeon_name} — Zooming in...")
             elif self.running:
-                self.lbl_dungeon.config(text="Azeroth Overview — Searching for Position Fix...")
+                self._set_dungeon_label("Azeroth Overview — Searching for Position Fix...")
             else:
-                self.lbl_dungeon.config(text="Azeroth Overview — Click 'Start Capture' or select a map")
+                self._set_dungeon_label("Azeroth Overview — Click 'Start Capture' or select a map")
             return
 
         if self.view_3d_mode:
@@ -2018,6 +2286,7 @@ class ForeverNavigatorApp:
         self.running = False
         self._stop_capture_event.set()
         self._cancel_fix_transition()
+        self._cancel_smooth_zoom()
         for attr in ("_poll_after_id", "_render_after_id", "_settle_after_id"):
             aid = getattr(self, attr, None)
             if aid is not None:
@@ -2046,7 +2315,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ForeverNavigator standalone GUI")
     parser.add_argument("--index-dir", default="data/index")
     parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument("--tk", action="store_true", help="Force legacy Tkinter UI instead of GPU PySide6 UI")
     args = parser.parse_args()
+    if not args.tk:
+        try:
+            from .qt_app import run_qt_app
+
+            sys.exit(run_qt_app(index_dir=args.index_dir, fps=args.fps))
+        except ImportError:
+            pass
     ForeverNavigatorApp(index_dir=args.index_dir, fps=args.fps).run()
 
 

@@ -6,3 +6,4 @@ onnxruntime>=1.18
 moderngl>=5.10
 pyrr>=0.10
 websockets>=13.0
+PySide6-Essentials>=6.7

@@ -13,7 +13,7 @@ for %%A in (%*) do (
 
 if "%FORCE_UPDATE%"=="" (
     if exist ".venv\Scripts\python.exe" (
-        ".venv\Scripts\python.exe" -c "import tkinter, numpy, PIL, cv2, mss, onnxruntime, moderngl, pyrr, websockets" >nul 2>&1
+        ".venv\Scripts\python.exe" -c "import tkinter, numpy, PIL, cv2, mss, onnxruntime, moderngl, pyrr, websockets, PySide6" >nul 2>&1
         if !ERRORLEVEL!==0 (
             if "%INSTALL_ONLY%"=="1" (
                 echo All ForeverNavigator runtime dependencies are installed.

@@ -120,6 +120,7 @@ class MinimapTracker:
         map_work_size: int = 160,
         high_precision: bool = False,
         use_gpu: bool = True,
+        lazy_precompute: bool = False,
     ):
         self.dungeons = dungeons
         self.dungeon_order = dungeon_order
@@ -128,6 +129,7 @@ class MinimapTracker:
         self.map_work_size = map_work_size
         self.high_precision = bool(high_precision)
         self.use_gpu = bool(use_gpu)
+        self.lazy_precompute = bool(lazy_precompute)
         self._lock = threading.RLock()
         self._executor: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(max_workers=min(12, max(2, os.cpu_count() or 4)), thread_name_prefix="MMTrack")
@@ -148,8 +150,9 @@ class MinimapTracker:
         self._scale_ratio: Dict[str, float] = {}
         self._coarse_ratio: Dict[str, float] = {}
 
-        for slug, d in self.dungeons.items():
-            self._precompute_dungeon(slug, d)
+        if not self.lazy_precompute:
+            for slug, d in self.dungeons.items():
+                self._precompute_dungeon(slug, d)
 
         n_d = len(self.dungeon_order)
         self.dungeon_probs = np.full(n_d, 1.0 / max(1, n_d), dtype=np.float64)
@@ -277,10 +280,18 @@ class MinimapTracker:
             self._valid_center[slug] = valid
             self._coarse_valid[slug] = c_valid
 
+    def _ensure_precomputed(self, slug: str) -> None:
+        if slug in self._map_sil:
+            return
+        d = self.dungeons.get(slug)
+        if d is not None:
+            self._precompute_dungeon(slug, d)
+
     def register_dungeon(self, dungeon: DungeonData, is_shared: bool = False) -> None:
         """Dynamically register an on-demand loaded map/zone/dungeon into the minimap tracker."""
         slug = dungeon.slug
-        self._precompute_dungeon(slug, dungeon)
+        if not self.lazy_precompute or self._map_sil:
+            self._precompute_dungeon(slug, dungeon)
         with self._lock:
             if is_shared or slug.startswith("wmo_"):
                 self._shared_map_slugs.add(slug)
@@ -321,6 +332,7 @@ class MinimapTracker:
         When prev_work_xy & plausible_radius_work are provided, prefers a strong local match within
         physically plausible travel distance over a marginally higher distant match.
         """
+        self._ensure_precomputed(slug)
         m_sil = self._map_sil[slug]
         m_edge = self._map_edge[slug]
         mh, mw = m_sil.shape[:2]
@@ -417,6 +429,7 @@ class MinimapTracker:
         angles_deg: Tuple[float, ...],
     ) -> float:
         """Ultra-fast coarse screening score at 72x72 (~0.25 ms per dungeon)."""
+        self._ensure_precomputed(slug)
         d = self.dungeons[slug]
         m_sil = self._coarse_sil[slug]
         mh, mw = m_sil.shape[:2]
@@ -511,6 +524,7 @@ class MinimapTracker:
         )
 
         def eval_fine(slug: str) -> Tuple[float, Tuple[float, float]]:
+            self._ensure_precomputed(slug)
             d = self.dungeons[slug]
             ratio = self._scale_ratio[slug]
             w_sz = self._map_sil[slug].shape[0]

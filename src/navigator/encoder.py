@@ -7,7 +7,6 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 
 
 def build_default_ui_mask(height: int = 224, width: int = 224) -> np.ndarray:
@@ -116,6 +115,8 @@ class ONNXVisualEncoder:
         self.onnx_path = Path(onnx_path)
         self.input_size = input_size
         self.default_mask = build_default_ui_mask(input_size, input_size)
+
+        import onnxruntime as ort
 
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = num_threads

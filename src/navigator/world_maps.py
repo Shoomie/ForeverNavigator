@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import struct
 import threading
 from collections import OrderedDict
@@ -502,6 +503,11 @@ class WorldMapRegistry:
         self._noliquid_tiles_by_folder: Optional[Dict[str, List[Tuple[int, int, int]]]] = None
         self._wmo_tiles_by_model: Optional[Dict[str, List[Tuple[int, int, int, int]]]] = None
         self._wmo_root_fdids: Optional[Dict[str, int]] = None
+        self._idx_db_path: Optional[Path] = None
+        self._idx_meta_counts: Optional[Dict[str, int]] = None
+        self._idx_folder_names: List[str] = []
+        self._idx_noliquid_names: List[str] = []
+        self._idx_wmo_names: List[str] = []
 
         self._build_catalog()
 
@@ -528,9 +534,18 @@ class WorldMapRegistry:
         return None
 
     def _is_cached(self, slug: str) -> bool:
+        stems = getattr(self, "_startup_cached_stems", None)
+        if stems is not None:
+            return slug in stems
         return (self.index_dir / f"{slug}.npz").exists() or (self.cache_dir / f"{slug}.npz").exists()
 
     def _build_catalog(self) -> None:
+        cached_stems: set[str] = set()
+        for d_dir in (self.index_dir, self.cache_dir):
+            if d_dir.exists():
+                for p in d_dir.glob("*.npz"):
+                    cached_stems.add(p.stem)
+        self._startup_cached_stems = cached_stems
         # 1. Pre-indexed dungeons/raids from data/index/manifest.json
         manifest_path = self.index_dir / "manifest.json"
         if manifest_path.exists():
@@ -602,8 +617,9 @@ class WorldMapRegistry:
             for e in self._entries.values()
             if e.minimap_folder and e.bounds_xy is None
         }
-        if self._minimap_tiles_by_folder:
-            for folder in sorted(self._minimap_tiles_by_folder.keys()):
+        folder_names = sorted(self._minimap_tiles_by_folder.keys()) if self._minimap_tiles_by_folder else self._idx_folder_names
+        if folder_names:
+            for folder in folder_names:
                 if folder.lower() in known_folders_lower:
                     continue
                 slug = _slugify(folder)
@@ -625,8 +641,9 @@ class WorldMapRegistry:
                 )
 
         # 5. Register every noLiquid minimap folder variant
-        if self._noliquid_tiles_by_folder:
-            for folder in sorted(self._noliquid_tiles_by_folder.keys()):
+        noliq_names = sorted(self._noliquid_tiles_by_folder.keys()) if self._noliquid_tiles_by_folder else self._idx_noliquid_names
+        if noliq_names:
+            for folder in noliq_names:
                 slug = f"{_slugify(folder)}_noliquid"
                 if slug in self._entries:
                     continue
@@ -643,8 +660,9 @@ class WorldMapRegistry:
                 )
 
         # 6. Register every WMO / Cave / Building / Doodad minimap model (deduplicated canonical entries)
-        if self._wmo_tiles_by_model:
-            for model_key in sorted(self._wmo_tiles_by_model.keys()):
+        wmo_names = sorted(self._wmo_tiles_by_model.keys()) if self._wmo_tiles_by_model else self._idx_wmo_names
+        if wmo_names:
+            for model_key in wmo_names:
                 slug = f"wmo_{_slugify(model_key)}"
                 if slug in self._entries:
                     continue
@@ -663,6 +681,7 @@ class WorldMapRegistry:
                     is_shared=shared,
                     shared_note="Shared cave/building minimap (used at multiple world locations)" if shared else "",
                 )
+        self._startup_cached_stems = None
 
     def list_all_maps(self, category: Optional[str] = None, query: str = "") -> List[WorldMapEntry]:
         """Return all discovered WoW: Forever maps, optionally filtered by category and search query."""
@@ -693,29 +712,152 @@ class WorldMapRegistry:
     def get_entry(self, slug: str) -> Optional[WorldMapEntry]:
         return self._entries.get(slug)
 
+    def _write_sqlite_minimap_index(
+        self,
+        db_path: Path,
+        tiles: Dict[str, List[Tuple[int, int, int]]],
+        noliquid: Dict[str, List[Tuple[int, int, int]]],
+        wmos: Dict[str, List[Tuple[int, int, int, int]]],
+        wmo_roots: Dict[str, int],
+    ) -> None:
+        tmp = db_path.with_suffix(".db.tmp")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+        conn = sqlite3.connect(str(tmp))
+        try:
+            conn.executescript(
+                """
+                PRAGMA journal_mode=OFF;
+                PRAGMA synchronous=OFF;
+                CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+                CREATE TABLE catalog_keys (kind TEXT NOT NULL, name TEXT NOT NULL);
+                CREATE TABLE folder_tiles (kind TEXT NOT NULL, folder_lower TEXT NOT NULL, tx INTEGER NOT NULL, ty INTEGER NOT NULL, fid INTEGER NOT NULL);
+                CREATE TABLE wmo_tiles (model TEXT NOT NULL, grp INTEGER NOT NULL, tx INTEGER NOT NULL, ty INTEGER NOT NULL, fid INTEGER NOT NULL);
+                CREATE TABLE wmo_roots (model TEXT PRIMARY KEY, fid INTEGER NOT NULL);
+                """
+            )
+            n_map = sum(len(v) for v in tiles.values())
+            n_noliq = sum(len(v) for v in noliquid.values())
+            n_wmo = sum(len(v) for v in wmos.values())
+            conn.executemany(
+                "INSERT INTO meta VALUES (?, ?)",
+                [
+                    ("version", MINIMAP_INDEX_VERSION),
+                    ("map_folders", len(tiles)),
+                    ("map_tiles", n_map),
+                    ("noliquid_folders", len(noliquid)),
+                    ("noliquid_tiles", n_noliq),
+                    ("wmo_models", len(wmos)),
+                    ("wmo_tiles", n_wmo),
+                ],
+            )
+            cat_rows = (
+                [("folder", k) for k in sorted(tiles.keys())]
+                + [("noliquid", k) for k in sorted(noliquid.keys())]
+                + [("wmo", k) for k in sorted(wmos.keys())]
+            )
+            conn.executemany("INSERT INTO catalog_keys VALUES (?, ?)", cat_rows)
+            ft_rows = [
+                ("folder", k.lower(), int(a), int(b), int(c))
+                for k, v in tiles.items()
+                for a, b, c in v
+            ] + [
+                ("noliquid", k.lower(), int(a), int(b), int(c))
+                for k, v in noliquid.items()
+                for a, b, c in v
+            ]
+            conn.executemany("INSERT INTO folder_tiles VALUES (?, ?, ?, ?, ?)", ft_rows)
+            wt_rows = [
+                (k, int(g), int(x), int(y), int(fid))
+                for k, v in wmos.items()
+                for g, x, y, fid in v
+            ]
+            conn.executemany("INSERT INTO wmo_tiles VALUES (?, ?, ?, ?, ?)", wt_rows)
+            conn.executemany(
+                "INSERT INTO wmo_roots VALUES (?, ?)",
+                [(k, int(fid)) for k, fid in wmo_roots.items()],
+            )
+            conn.executescript(
+                """
+                CREATE INDEX idx_ft_kf ON folder_tiles(kind, folder_lower);
+                CREATE INDEX idx_wt_m ON wmo_tiles(model);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        tmp.replace(db_path)
+
+    def _load_sqlite_minimap_index(self, db_path: Path) -> bool:
+        if not db_path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(str(db_path))
+            try:
+                meta = dict(conn.execute("SELECT k, v FROM meta").fetchall())
+                if meta.get("version") != MINIMAP_INDEX_VERSION:
+                    return False
+                f_names: List[str] = []
+                n_names: List[str] = []
+                w_names: List[str] = []
+                for kind, name in conn.execute("SELECT kind, name FROM catalog_keys"):
+                    if kind == "folder":
+                        f_names.append(name)
+                    elif kind == "noliquid":
+                        n_names.append(name)
+                    elif kind == "wmo":
+                        w_names.append(name)
+            finally:
+                conn.close()
+            self._idx_db_path = db_path
+            self._idx_meta_counts = meta
+            self._idx_folder_names = f_names
+            self._idx_noliquid_names = n_names
+            self._idx_wmo_names = w_names
+            return True
+        except Exception:
+            return False
+
     def _load_cached_minimap_index(self) -> bool:
-        """Load v2 minimap_tiles_index.json if present. Returns True if v2 cache was loaded."""
+        """Load fast SQLite minimap index (~5 ms, <1 MB RAM), migrating from JSON once if needed."""
+        db_cache = self.cache_dir / "minimap_tiles_index.db"
         idx_cache = self.cache_dir / "minimap_tiles_index.json"
+        if db_cache.exists() and (not idx_cache.exists() or db_cache.stat().st_mtime >= idx_cache.stat().st_mtime):
+            if self._load_sqlite_minimap_index(db_cache):
+                return True
         if not idx_cache.exists():
             return False
         try:
             raw = json.loads(idx_cache.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and raw.get("version") == MINIMAP_INDEX_VERSION:
-                self._minimap_tiles_by_folder = {
+                tiles = {
                     k: [(int(a), int(b), int(c)) for a, b, c in v]
                     for k, v in raw.get("folders", {}).items()
                 }
-                self._noliquid_tiles_by_folder = {
+                noliquid = {
                     k: [(int(a), int(b), int(c)) for a, b, c in v]
                     for k, v in raw.get("noliquid", {}).items()
                 }
-                self._wmo_tiles_by_model = {
+                wmos = {
                     k: [(int(g), int(x), int(y), int(fid)) for g, x, y, fid in v]
                     for k, v in raw.get("wmos", {}).items()
                 }
-                self._wmo_root_fdids = {
+                wmo_roots = {
                     k: int(fid) for k, fid in raw.get("wmo_roots", {}).items()
                 }
+                try:
+                    self._write_sqlite_minimap_index(db_cache, tiles, noliquid, wmos, wmo_roots)
+                    if self._load_sqlite_minimap_index(db_cache):
+                        return True
+                except Exception:
+                    pass
+                self._minimap_tiles_by_folder = tiles
+                self._noliquid_tiles_by_folder = noliquid
+                self._wmo_tiles_by_model = wmos
+                self._wmo_root_fdids = wmo_roots
                 return True
         except Exception:
             pass
@@ -724,12 +866,13 @@ class WorldMapRegistry:
 
     def _ensure_minimap_tile_index(self, casc: LocalCASC) -> Dict[str, List[Tuple[int, int, int]]]:
         """Load or build full v2 index of ALL minimap BLP files (mapXX_YY, noLiquid, numeric folders, WMOs) from listfile.csv + CASC."""
+        if self._idx_db_path is not None:
+            return self._minimap_tiles_by_folder or {}
         if self._minimap_tiles_by_folder is not None and self._wmo_tiles_by_model is not None:
             return self._minimap_tiles_by_folder
 
         if self._load_cached_minimap_index():
-            assert self._minimap_tiles_by_folder is not None
-            return self._minimap_tiles_by_folder
+            return self._minimap_tiles_by_folder or {}
 
         tiles: Dict[str, List[Tuple[int, int, int]]] = {}
         noliquid: Dict[str, List[Tuple[int, int, int]]] = {}
@@ -809,6 +952,21 @@ class WorldMapRegistry:
 
     def get_minimap_coverage_stats(self) -> Dict[str, int]:
         """Return counts of indexed minimap files across all categories."""
+        if self._idx_meta_counts is not None:
+            m = self._idx_meta_counts
+            n_map = int(m.get("map_tiles", 0))
+            n_noliq = int(m.get("noliquid_tiles", 0))
+            n_wmo = int(m.get("wmo_tiles", 0))
+            return {
+                "map_folders": int(m.get("map_folders", 0)),
+                "map_tiles": n_map,
+                "noliquid_folders": int(m.get("noliquid_folders", 0)),
+                "noliquid_tiles": n_noliq,
+                "wmo_models": int(m.get("wmo_models", 0)),
+                "wmo_tiles": n_wmo,
+                "total_minimap_files": n_map + n_noliq + n_wmo,
+                "catalog_entries": len(self._entries),
+            }
         folders = self._minimap_tiles_by_folder or {}
         noliq = self._noliquid_tiles_by_folder or {}
         wmos = self._wmo_tiles_by_model or {}
@@ -846,6 +1004,43 @@ class WorldMapRegistry:
                 return False
         self._attach_fullres_source_for_entry(entry, d)
         return slug in self._fullres_sources
+
+    def load_continent_l1_array(self, cont_slug: str, max_px: int = 4096) -> Optional[Tuple[np.ndarray, int]]:
+        """Load or build a fast prestitched Level-1 continent JPEG (~1.3 MB, WoW: Forever masked).
+
+        Returns (rgb_uint8_array, native_map_px) so mid-range zoom (3x..15x) is crisp with zero CASC I/O.
+        """
+        folder = "Kalimdor" if cont_slug == "kalimdor" else ("Azeroth" if cont_slug == "eastern_kingdoms" else None)
+        if folder is None:
+            return None
+        l1_jpg = self.cache_dir / f"{cont_slug}_l1_{max_px}.jpg"
+        cache_npz = self.cache_dir / f"{cont_slug}.npz"
+        if l1_jpg.exists() and (not cache_npz.exists() or l1_jpg.stat().st_mtime >= cache_npz.stat().st_mtime):
+            try:
+                with Image.open(l1_jpg) as raw_im:
+                    arr = np.asarray(raw_im.convert("RGB"), dtype=np.uint8).copy()
+                return arr, int(max(arr.shape[0], OVERVIEW_MAP_PX))
+            except Exception:
+                pass
+        try:
+            cont_d = self.load_map(cont_slug, preview_only=False)
+        except Exception:
+            return None
+        arr = cont_d.map_image.copy()
+        if arr.shape[0] > max_px:
+            arr = cv2.resize(arr, (max_px, max_px), interpolation=cv2.INTER_AREA)
+        ph, pw = arr.shape[:2]
+        playable = _build_forever_playable_mask(folder, cont_d, ph, pw, pad_yards=360.0)
+        ocean = np.array([18, 36, 58], dtype=np.uint8)
+        diff_ocean = np.abs(arr.astype(np.int16) - np.array([22, 46, 72], dtype=np.int16)).max(axis=-1)
+        diff_dark = np.abs(arr.astype(np.int16) - np.array([18, 22, 29], dtype=np.int16)).max(axis=-1)
+        keep = playable & (diff_ocean > 12) & (diff_dark > 12) & (arr.max(axis=-1) > 14)
+        arr[~keep] = ocean
+        try:
+            Image.fromarray(arr, mode="RGB").save(l1_jpg, format="JPEG", quality=90, optimize=True)
+        except Exception:
+            pass
+        return arr, int(cont_d.map_size_px)
 
     def set_storage_mode(self, mode: str) -> None:
         """Configure tile cache budgets for 'ssd' (low RAM, dynamic streaming) vs 'hdd' (larger cache)."""
@@ -996,17 +1191,74 @@ class WorldMapRegistry:
 
     def _lookup_folder_tiles(
         self,
-        tiles_map: Dict[str, List[Tuple[int, int, int]]],
+        tiles_map: Optional[Dict[str, List[Tuple[int, int, int]]]],
         folder: str,
+        kind: str = "folder",
     ) -> Optional[List[Tuple[int, int, int]]]:
-        folder_tiles = tiles_map.get(folder)
-        if not folder_tiles:
-            low_target = folder.lower()
-            for k, v in tiles_map.items():
-                if k.lower() == low_target:
-                    folder_tiles = v
-                    break
-        return folder_tiles
+        if tiles_map:
+            folder_tiles = tiles_map.get(folder)
+            if not folder_tiles:
+                low_target = folder.lower()
+                for k, v in tiles_map.items():
+                    if k.lower() == low_target:
+                        folder_tiles = v
+                        break
+            if folder_tiles:
+                return folder_tiles
+        if self._idx_db_path is not None and self._idx_db_path.exists():
+            try:
+                conn = sqlite3.connect(str(self._idx_db_path))
+                try:
+                    rows = conn.execute(
+                        "SELECT tx, ty, fid FROM folder_tiles WHERE kind = ? AND folder_lower = ?",
+                        (kind, folder.lower()),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                if rows:
+                    return [(int(a), int(b), int(c)) for a, b, c in rows]
+            except Exception:
+                pass
+        return None
+
+    def _lookup_wmo_tiles(self, model_key: str) -> Optional[List[Tuple[int, int, int, int]]]:
+        if self._wmo_tiles_by_model:
+            res = self._wmo_tiles_by_model.get(model_key)
+            if res:
+                return res
+        if self._idx_db_path is not None and self._idx_db_path.exists():
+            try:
+                conn = sqlite3.connect(str(self._idx_db_path))
+                try:
+                    rows = conn.execute(
+                        "SELECT grp, tx, ty, fid FROM wmo_tiles WHERE model = ?",
+                        (model_key,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                if rows:
+                    return [(int(g), int(x), int(y), int(fid)) for g, x, y, fid in rows]
+            except Exception:
+                pass
+        return None
+
+    def _lookup_wmo_root(self, model_key: str) -> Optional[int]:
+        if self._wmo_root_fdids:
+            fid = self._wmo_root_fdids.get(model_key)
+            if fid is not None:
+                return fid
+        if self._idx_db_path is not None and self._idx_db_path.exists():
+            try:
+                conn = sqlite3.connect(str(self._idx_db_path))
+                try:
+                    row = conn.execute("SELECT fid FROM wmo_roots WHERE model = ?", (model_key,)).fetchone()
+                finally:
+                    conn.close()
+                if row:
+                    return int(row[0])
+            except Exception:
+                pass
+        return None
 
     def _attach_fullres_source_for_entry(self, entry: WorldMapEntry, d: DungeonData) -> None:
         if self.wow_dir is None or not entry.minimap_folder:
@@ -1014,12 +1266,9 @@ class WorldMapRegistry:
         try:
             with LocalCASC(self.wow_dir, product="wowf") as casc:
                 tiles_map = self._ensure_minimap_tile_index(casc)
-                src_map = (
-                    self._noliquid_tiles_by_folder
-                    if entry.source == "casc_noliquid" and self._noliquid_tiles_by_folder
-                    else tiles_map
-                )
-                folder_tiles = self._lookup_folder_tiles(src_map, entry.minimap_folder)
+                kind = "noliquid" if entry.source == "casc_noliquid" else "folder"
+                src_map = self._noliquid_tiles_by_folder if kind == "noliquid" else tiles_map
+                folder_tiles = self._lookup_folder_tiles(src_map, entry.minimap_folder, kind=kind)
                 if not folder_tiles:
                     return
                 tile_lookup = {(tx, ty): fid for tx, ty, fid in folder_tiles}
@@ -1058,8 +1307,7 @@ class WorldMapRegistry:
             tiles_map = self._ensure_minimap_tile_index(casc)
 
             if entry.source == "casc_wmo" and entry.wmo_model:
-                wmos = self._wmo_tiles_by_model or {}
-                wmo_tiles = wmos.get(entry.wmo_model)
+                wmo_tiles = self._lookup_wmo_tiles(entry.wmo_model)
                 if not wmo_tiles:
                     return None, 0
                 return self._stitch_wmo_model(casc, entry, wmo_tiles)
@@ -1068,13 +1316,11 @@ class WorldMapRegistry:
                 return None, 0
 
             if entry.source == "casc_noliquid":
-                noliq_map = self._noliquid_tiles_by_folder or {}
-                folder_tiles = self._lookup_folder_tiles(noliq_map, entry.minimap_folder)
+                folder_tiles = self._lookup_folder_tiles(self._noliquid_tiles_by_folder, entry.minimap_folder, kind="noliquid")
                 fallback_tiles: Optional[List[Tuple[int, int, int]]] = None
             else:
-                folder_tiles = self._lookup_folder_tiles(tiles_map, entry.minimap_folder)
-                noliq_map = self._noliquid_tiles_by_folder or {}
-                fallback_tiles = self._lookup_folder_tiles(noliq_map, entry.minimap_folder)
+                folder_tiles = self._lookup_folder_tiles(tiles_map, entry.minimap_folder, kind="folder")
+                fallback_tiles = self._lookup_folder_tiles(self._noliquid_tiles_by_folder, entry.minimap_folder, kind="noliquid")
 
             if not folder_tiles:
                 return None, 0
@@ -1335,7 +1581,7 @@ class WorldMapRegistry:
 
         # Try reading MOGI group bounding boxes from the matching .wmo root in CASC
         mogi_boxes: Dict[int, Tuple[float, float, float, float]] = {}
-        wmo_root_fid = (self._wmo_root_fdids or {}).get(entry.wmo_model or "")
+        wmo_root_fid = self._lookup_wmo_root(entry.wmo_model or "")
         if wmo_root_fid is not None:
             try:
                 root_bytes = casc.read_file(wmo_root_fid)

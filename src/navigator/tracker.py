@@ -150,11 +150,16 @@ class CombatLogWatcher:
         return self.last_zone_hint
 
 
-def load_dungeon_npz(npz_path: Path, max_preview_px: Optional[int] = None) -> DungeonData:
+def load_dungeon_npz(
+    npz_path: Path,
+    max_preview_px: Optional[int] = None,
+    load_embeddings: bool = True,
+) -> DungeonData:
     """Load a DungeonData object from a pre-indexed or cached .npz file.
 
     When `max_preview_px` is set and the stored image is larger, downscales `map_image` in RAM
     to a lightweight preview while preserving `native_map_px` and `map_full_path` for on-demand streaming.
+    When `load_embeddings=False`, skips 3D visual embeddings & graph edges to save ~100+ MB RAM.
     """
     npz_path = Path(npz_path)
     with np.load(npz_path, allow_pickle=False) as z:
@@ -162,24 +167,29 @@ def load_dungeon_npz(npz_path: Path, max_preview_px: Optional[int] = None) -> Du
         n_wp = max(1, len(waypoints))
 
         adj: List[List[int]] = [[] for _ in range(n_wp)]
-        if "edges_src" in z and "edges_dst" in z:
+        if load_embeddings and "edges_src" in z and "edges_dst" in z:
             edges_src = z["edges_src"].astype(np.int32)
             edges_dst = z["edges_dst"].astype(np.int32)
             for u, v in zip(edges_src.tolist(), edges_dst.tolist()):
                 adj[u].append(v)
 
-        if "embeddings_i8" in z:
+        if load_embeddings and "embeddings_i8" in z:
             embs = z["embeddings_i8"].astype(np.float32) / 127.0
             if len(embs) > 0:
                 embs /= np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
         else:
             embs = np.zeros((0, 1), dtype=np.float32)
 
-        view_wp_idx = z["view_wp_idx"].astype(np.int32) if "view_wp_idx" in z else np.zeros((0,), dtype=np.int32)
-        wp_to_views: List[List[int]] = [[] for _ in range(n_wp)]
-        for vi, wi in enumerate(view_wp_idx.tolist()):
-            if 0 <= wi < n_wp:
-                wp_to_views[wi].append(vi)
+        if load_embeddings and "view_wp_idx" in z:
+            view_wp_idx = z["view_wp_idx"].astype(np.int32)
+            wp_to_views: List[List[int]] = [[] for _ in range(n_wp)]
+            for vi, wi in enumerate(view_wp_idx.tolist()):
+                if 0 <= wi < n_wp:
+                    wp_to_views[wi].append(vi)
+            wp_to_views_arr = [np.array(v, dtype=np.int32) for v in wp_to_views]
+        else:
+            view_wp_idx = np.zeros((0,), dtype=np.int32)
+            wp_to_views_arr = []
 
         kw_raw = z["combatlog_keywords"].tolist() if "combatlog_keywords" in z else []
         b_xy: Optional[Tuple[float, float, float, float]] = None
@@ -206,12 +216,37 @@ def load_dungeon_npz(npz_path: Path, max_preview_px: Optional[int] = None) -> Du
             map_scale=float(z["map_scale"]),
             embeddings_f32=embs,
             view_wp_idx=view_wp_idx,
-            wp_to_views=[np.array(v, dtype=np.int32) for v in wp_to_views],
+            wp_to_views=wp_to_views_arr,
             map_rot90=int(z["map_rot90"]) if "map_rot90" in z else 0,
             bounds_xy=b_xy,
             native_map_px=native_px,
             map_full_path=full_path,
         )
+
+
+class LightweightDungeonStore:
+    """Zero-ONNX, low-RAM dungeon index container for 2D minimap mode (saves ~160 MB vs MultiDungeonTracker)."""
+
+    def __init__(self, index_dir: str | Path, max_preview_px: int = 512):
+        self.index_dir = Path(index_dir)
+        self.dungeons: Dict[str, DungeonData] = {}
+        self.dungeon_order: List[str] = []
+        manifest_path = self.index_dir / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for entry in manifest.get("dungeons", []):
+                d = load_dungeon_npz(
+                    self.index_dir / entry["file"],
+                    max_preview_px=max_preview_px,
+                    load_embeddings=False,
+                )
+                self.dungeons[d.slug] = d
+                self.dungeon_order.append(d.slug)
+
+    def register_dungeon(self, dungeon: DungeonData) -> None:
+        self.dungeons[dungeon.slug] = dungeon
+        if dungeon.slug not in self.dungeon_order:
+            self.dungeon_order.append(dungeon.slug)
 
 
 class MultiDungeonTracker:

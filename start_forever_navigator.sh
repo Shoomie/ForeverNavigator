@@ -16,7 +16,7 @@ done
 NEEDS_INSTALL=0
 if [ "$FORCE_UPDATE" -eq 1 ] || [ ! -x ".venv/bin/python" ]; then
     NEEDS_INSTALL=1
-elif ! .venv/bin/python -c "import tkinter, numpy, PIL, cv2, mss, onnxruntime, moderngl, pyrr, websockets" >/dev/null 2>&1; then
+elif ! .venv/bin/python -c "import tkinter, numpy, PIL, cv2, mss, onnxruntime, moderngl, pyrr, websockets, PySide6" >/dev/null 2>&1; then
     NEEDS_INSTALL=1
 fi
 
