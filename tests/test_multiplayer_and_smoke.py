@@ -493,7 +493,7 @@ class TestWorldMapsAndModernUI(unittest.TestCase):
     @unittest.skipUnless((INDEX_DIR / "manifest.json").exists(), "Index not present")
     def test_qt_gpu_ui_instantiation_render_and_close(self):
         try:
-            from PySide6.QtGui import QSurfaceFormat
+            from PySide6.QtGui import QImage, QSurfaceFormat
             from PySide6.QtWidgets import QApplication
             from src.ui.qt_app import ForeverNavigatorQtWindow
         except ImportError:
@@ -509,6 +509,15 @@ class TestWorldMapsAndModernUI(unittest.TestCase):
         win = ForeverNavigatorQtWindow(INDEX_DIR)
         try:
             win.show()
+            # Wait briefly for async 4K Azeroth overview preload to upload to VRAM
+            t_end = time.time() + 3.0
+            while time.time() < t_end:
+                qt_app.processEvents()
+                if "__azeroth_ov" in win.viewport._textures:
+                    break
+                time.sleep(0.02)
+            # Trigger two full repaints to ensure multi-frame OpenGL + overlay stability
+            win.viewport.repaint()
             qt_app.processEvents()
             win.viewport.repaint()
             qt_app.processEvents()
@@ -516,6 +525,11 @@ class TestWorldMapsAndModernUI(unittest.TestCase):
             self.assertGreater(len(win._all_map_entries), 0)
             self.assertTrue(win._can_edit_whiteboard())
             self.assertTrue(win._showing_azeroth_overview)
+            # Verify the OpenGL framebuffer actually rendered non-blank map pixels
+            if "__azeroth_ov" in win.viewport._textures:
+                fb = win.viewport.grabFramebuffer().convertToFormat(QImage.Format.Format_RGBA8888)
+                arr = np.frombuffer(fb.constBits(), dtype=np.uint8).reshape((fb.height(), fb.width(), 4))
+                self.assertGreater(int(np.std(arr[:, :, :3])), 5)
         finally:
             win.close()
             qt_app.processEvents()

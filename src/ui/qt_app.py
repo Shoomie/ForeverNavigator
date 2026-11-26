@@ -198,6 +198,30 @@ def _role_badge(role: str) -> str:
     return {"LEADER": "L", "OFFICER": "O", "TANK": "T", "HEALER": "H"}.get(r, "D")
 
 
+class _MapOverlayWidget(QWidget):
+    """Transparent vector overlay child widget composited cleanly on top of GPUMapViewport.
+
+    Keeping QPainter on a child overlay widget prevents Qt's QOpenGL2PaintEngineEx from
+    mutating OpenGL state behind ModernGL's back (which otherwise leaves ModernGL's cached
+    VAO/program bindings stale and renders blank frames after the first QPainter pass).
+    """
+
+    def __init__(self, viewport: "GPUMapViewport"):
+        super().__init__(viewport)
+        self._viewport = viewport
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, _event) -> None:
+        cw = float(max(1, self.width()))
+        ch = float(max(1, self.height()))
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._viewport._paint_overlays(painter, cw, ch)
+        painter.end()
+
+
 class GPUMapViewport(QOpenGLWidget):
     """Hardware-accelerated OpenGL 2D/3D map viewport with GPU mipmaps + QPainter vector overlays."""
 
@@ -215,6 +239,17 @@ class GPUMapViewport(QOpenGLWidget):
         self._tex_versions: Dict[str, int] = {}
         self._pending_uploads: Dict[str, Tuple[np.ndarray, bool]] = {}  # key -> (rgb_arr, build_mips)
         self._pending_evictions: List[str] = []
+        self._pending_3d_scene: Optional[Tuple[str, Dict[str, Any]]] = None
+        self._overlay = _MapOverlayWidget(self)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._overlay.setGeometry(0, 0, self.width(), self.height())
+
+    def update(self, *args) -> None:  # type: ignore[override]
+        super().update(*args)
+        if hasattr(self, "_overlay") and self._overlay is not None:
+            self._overlay.update()
 
     def queue_texture_upload(self, key: str, arr_rgb: np.ndarray, build_mips: bool = True) -> None:
         """Schedule an RGB uint8 numpy array to be uploaded to GPU VRAM on the next paintGL."""
@@ -234,6 +269,7 @@ class GPUMapViewport(QOpenGLWidget):
             return
         try:
             self.makeCurrent()
+            self.win.viewer_3d.release_gl_only()
             for tex, _, _, _ in self._textures.values():
                 try:
                     tex.release()
@@ -357,29 +393,24 @@ class GPUMapViewport(QOpenGLWidget):
         fb_w = max(1, int(round(cw * dpr)))
         fb_h = max(1, int(round(ch * dpr)))
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.beginNativePainting()
-
         if self._mgl is not None:
             self._flush_texture_ops()
             fbo = self._mgl.detect_framebuffer()
             fbo.use()
-            self._mgl.viewport = (0, 0, fb_w, fb_h)
-            self._mgl.disable(self._mgl.DEPTH_TEST)
+            fbo.viewport = (0, 0, fb_w, fb_h)
+            fbo.scissor = None
+            self._mgl.disable(self._mgl.DEPTH_TEST | self._mgl.CULL_FACE | self._mgl.BLEND)
             if self.win._showing_azeroth_overview and not self.win.view_3d_mode and not self.win.replay_mode:
-                self._mgl.clear(18 / 255.0, 36 / 255.0, 58 / 255.0, 1.0)
+                fbo.clear(18 / 255.0, 36 / 255.0, 58 / 255.0, 1.0)
                 self._paint_overview_gl(cw, ch)
             elif self.win.view_3d_mode:
-                self._mgl.clear(13 / 255.0, 17 / 255.0, 23 / 255.0, 1.0)
-                self._paint_3d_gl(cw, ch)
+                self._paint_3d_gl(fbo, cw, ch)
             else:
-                self._mgl.clear(13 / 255.0, 17 / 255.0, 23 / 255.0, 1.0)
+                fbo.clear(13 / 255.0, 17 / 255.0, 23 / 255.0, 1.0)
                 self._paint_zone_gl(cw, ch)
 
-        painter.endNativePainting()
-
-        # Vector overlays drawn crisply on top via QPainter
+    def _paint_overlays(self, painter: QPainter, cw: float, ch: float) -> None:
+        # Vector overlays drawn crisply on top via _MapOverlayWidget
         if self.win._showing_azeroth_overview and not self.win.view_3d_mode and not self.win.replay_mode:
             if "__azeroth_ov" not in self._textures:
                 painter.setPen(QColor("#8b949e"))
@@ -389,10 +420,10 @@ class GPUMapViewport(QOpenGLWidget):
                     Qt.AlignmentFlag.AlignCenter,
                     "Loading Azeroth Overview (Kalimdor & Eastern Kingdoms)...",
                 )
-        elif not self.win.view_3d_mode:
+        elif self.win.view_3d_mode:
+            self._paint_3d_overlays(painter, cw, ch)
+        else:
             self._paint_zone_overlays(painter, cw, ch)
-
-        painter.end()
 
     def _paint_overview_gl(self, cw: float, ch: float) -> None:
         ov = self.win._azeroth_overview
@@ -441,10 +472,110 @@ class GPUMapViewport(QOpenGLWidget):
             y1 = (float(ov.height) - self.win._overview_pan_y) * sc_ov + ch * 0.5
             self._draw_textured_quad(tex, x0, y0, x1, y1, cw, ch)
 
-    def _paint_3d_gl(self, cw: float, ch: float) -> None:
-        if "__view_3d" in self._textures:
-            tex, _, _, _ = self._textures["__view_3d"]
-            self._draw_textured_quad(tex, 0.0, 0.0, cw, ch, cw, ch)
+    def _paint_3d_gl(self, fbo: Any, cw: float, ch: float) -> None:
+        if self._mgl is None:
+            return
+        if self._pending_3d_scene is not None:
+            slug_p, prepared = self._pending_3d_scene
+            self._pending_3d_scene = None
+            self.win.viewer_3d.upload_prepared_scene(self._mgl, slug_p, prepared)
+
+        slug = self.win._active_slug()
+        d = self.win.tracker_3d.dungeons.get(slug)
+        if d is None or self.win.viewer_3d._loaded_slug != slug or self.win.viewer_3d._scene is None:
+            fbo.clear(18 / 255.0, 21 / 255.0, 28 / 255.0, 1.0)
+            self.win._request_3d_scene_async(slug)
+            return
+
+        self.win.viewer_3d.render_direct_gl(
+            self._mgl,
+            fbo,
+            slug,
+            d,
+            int(max(1, cw)),
+            int(max(1, ch)),
+            player_world=self.win._latest_est.world_pos if self.win._latest_est else None,
+            follow_player=self.win.chk_follow.isChecked(),
+        )
+
+    def _paint_3d_overlays(self, p: QPainter, cw: float, ch: float) -> None:
+        slug = self.win._active_slug()
+        d = self.win.tracker_3d.dungeons.get(slug)
+        v3d = self.win.viewer_3d
+        err = getattr(self.win, "_scene_3d_error", None)
+        if err:
+            p.setPen(QColor("#e6c373"))
+            p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+            p.drawText(QRectF(24, 0, cw - 48, ch), Qt.AlignmentFlag.AlignCenter, err)
+            return
+        if d is None or v3d._loaded_slug != slug or v3d._scene is None or v3d._last_mvp is None:
+            name = d.name if d is not None else slug
+            p.setPen(QColor("#8b949e"))
+            p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+            p.drawText(QRectF(0, 0, cw, ch), Qt.AlignmentFlag.AlignCenter, f"Loading 3D WMO Model ({name})...")
+            return
+
+        mvp_mat = v3d._last_mvp
+
+        def project(pts: np.ndarray):
+            ones = np.ones((len(pts), 1), dtype=np.float32)
+            clip = np.hstack([pts, ones]) @ mvp_mat
+            w_c = clip[:, 3]
+            valid = w_c > 0.5
+            ndc_x = np.where(valid, clip[:, 0] / np.maximum(0.5, w_c), -99.0)
+            ndc_y = np.where(valid, clip[:, 1] / np.maximum(0.5, w_c), -99.0)
+            return (ndc_x * 0.5 + 0.5) * cw, (0.5 - ndc_y * 0.5) * ch, valid
+
+        # Spawns
+        if self.win.chk_spawns.isChecked():
+            spawns = get_spawns_for_dungeon(slug)
+            if spawns:
+                map_h = d.map_size_px
+                sp_pts = []
+                for sp in spawns:
+                    wx, wy = d.map_px_to_world(sp.u * map_h, sp.v * map_h)
+                    wz = v3d.snap_world_z(d, np.array([wx, wy], dtype=np.float32))
+                    sp_pts.append([wx, wy, wz])
+                sp_arr = np.array(sp_pts, dtype=np.float32)
+                sp_top = sp_arr.copy()
+                sp_top[:, 2] += 14.0
+                bu, bv, bok = project(sp_arr)
+                pu, pv, pok = project(sp_top)
+                p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                for i, sp in enumerate(spawns):
+                    if not (bok[i] and pok[i]):
+                        continue
+                    bx, by, px, py = float(bu[i]), float(bv[i]), float(pu[i]), float(pv[i])
+                    if not (-40 <= px <= cw + 40 and -40 <= py <= ch + 40):
+                        continue
+                    col = QColor("#5adcfc") if sp.kind == "entrance" else QColor("#ffa53c")
+                    p.setPen(QPen(col, 2.0))
+                    p.drawLine(QPointF(bx, by), QPointF(px, py))
+                    p.setBrush(QBrush(col))
+                    p.setPen(QPen(QColor("#ffffff"), 1.2))
+                    p.drawEllipse(QPointF(px, py), 5.0, 5.0)
+                    p.setPen(QPen(col))
+                    p.drawText(QPointF(px + 8, py + 4), sp.label)
+
+        # Local player 3D beacon
+        if v3d._last_p3d is not None:
+            p3d = v3d._last_p3d
+            bu, bv, bok = project(p3d[None, :])
+            tu, tv, tok = project((p3d + np.array([0.0, 0.0, 18.0], dtype=np.float32))[None, :])
+            if bok[0] and tok[0]:
+                bx, by, tx, ty = float(bu[0]), float(bv[0]), float(tu[0]), float(tv[0])
+                p.setPen(QPen(QColor("#ff644b"), 3.0))
+                p.drawLine(QPointF(bx, by), QPointF(tx, ty))
+                p.setBrush(QBrush(QColor("#ff5041")))
+                p.setPen(QPen(QColor("#ffffff"), 2.0))
+                p.drawEllipse(QPointF(tx, ty), 7.0, 7.0)
+
+        p.setPen(QColor("#c8d2e1"))
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(
+            QPointF(10, ch - 10),
+            f"GPU 3D Model (WMO) | Left-drag: Orbit | Right-drag: Pan | Scroll: Zoom ({int(v3d.zoom * 100)}%)",
+        )
 
     def _paint_zone_gl(self, cw: float, ch: float) -> None:
         slug = self.win._active_slug()
@@ -617,15 +748,24 @@ class GPUMapViewport(QOpenGLWidget):
 class QtROIPickerOverlay(QWidget):
     """Translucent fullscreen overlay over the chosen monitor to drag a box around the WoW minimap."""
 
-    def __init__(self, mon: dict, on_done):
+    def __init__(self, mon: dict, on_done, screen=None):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.on_done = on_done
-        self.mon_w, self.mon_h = int(mon["width"]), int(mon["height"])
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setWindowOpacity(0.32)
         self.setStyleSheet("background-color: #0a0c10;")
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setGeometry(int(mon["left"]), int(mon["top"]), self.mon_w, self.mon_h)
+        if screen is not None:
+            geom = screen.geometry()
+            self.setGeometry(geom.x(), geom.y(), geom.width(), geom.height())
+        else:
+            dpr = float(self.devicePixelRatioF()) or 1.0
+            self.setGeometry(
+                int(round(int(mon["left"]) / dpr)),
+                int(round(int(mon["top"]) / dpr)),
+                int(round(int(mon["width"]) / dpr)),
+                int(round(int(mon["height"]) / dpr)),
+            )
         self._start: Optional[QPointF] = None
         self._cur: Optional[QPointF] = None
 
@@ -648,8 +788,17 @@ class QtROIPickerOverlay(QWidget):
         if self._start is not None and self._cur is not None:
             x0, x1 = sorted([self._start.x(), self._cur.x()])
             y0, y1 = sorted([self._start.y(), self._cur.y()])
+            lw = float(max(1, self.width()))
+            lh = float(max(1, self.height()))
             if x1 - x0 >= 20 and y1 - y0 >= 20:
-                self.on_done(MinimapROI(x0 / self.mon_w, y0 / self.mon_h, x1 / self.mon_w, y1 / self.mon_h))
+                self.on_done(
+                    MinimapROI(
+                        float(np.clip(x0 / lw, 0.0, 1.0)),
+                        float(np.clip(y0 / lh, 0.0, 1.0)),
+                        float(np.clip(x1 / lw, 0.0, 1.0)),
+                        float(np.clip(y1 / lh, 0.0, 1.0)),
+                    )
+                )
                 self.close()
         self._start = None
 
@@ -1385,6 +1534,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
                     elif p.exists():
                         with np.load(p, allow_pickle=False) as z:
                             arr = z["map_image"].astype(np.uint8)
+                    if arr is not None and arr.shape[0] > 512:
+                        self.tracker_mm.upgrade_zone_resolution(s, arr, max_work_px=1024)
                 except Exception:
                     arr = None
                 if not self._closing:
@@ -1681,6 +1832,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
     def _toggle_3d_view(self) -> None:
         self.view_3d_mode = not self.view_3d_mode
+        self._scene_3d_error = None
         self.btn_view3d.setText("View: 3D Model (GPU)" if self.view_3d_mode else "View: 2D Map (GPU)")
         self.btn_view3d.setObjectName("Purple" if self.view_3d_mode else "")
         self.btn_view3d.style().unpolish(self.btn_view3d)
@@ -1690,22 +1842,27 @@ class ForeverNavigatorQtWindow(QMainWindow):
         else:
             self.viewport.update()
 
+    def _request_3d_scene_async(self, slug: str) -> None:
+        loading = getattr(self, "_scene_3d_loading", None)
+        if loading == slug:
+            return
+        self._scene_3d_loading = slug
+        self._scene_3d_error = None
+
+        def _worker(s: str = slug) -> None:
+            prepared, err = self.viewer_3d.prepare_scene_cpu(s)
+            if not self._closing:
+                self._ui_queue.put(("scene_3d_prepared", (s, prepared, err)))
+
+        threading.Thread(target=_worker, daemon=True, name=f"QtLoad3D-{slug}").start()
+
     def _render_3d_frame(self) -> None:
         if not self.view_3d_mode:
             return
-        cw, ch = max(64, self.viewport.width()), max(64, self.viewport.height())
         slug = self._active_slug()
-        d = self.tracker_3d.dungeons[slug]
-        shown = self.replay_players if self.replay_mode else self.raid_players
-        img_3d = self.viewer_3d.render(
-            slug, d, cw, ch,
-            player_world=self._latest_est.world_pos if self._latest_est else None,
-            follow_player=self.chk_follow.isChecked(),
-            show_spawns=self.chk_spawns.isChecked(),
-            raid_players=list(shown.values()),
-            local_player_id=None if self.replay_mode else self.identity.player_id,
-        )
-        self.viewport.queue_texture_upload("__view_3d", img_3d, build_mips=False)
+        if self.viewer_3d._loaded_slug != slug or self.viewer_3d._scene is None:
+            self._request_3d_scene_async(slug)
+        self.viewport.update()
 
     def _adjust_zoom(self, factor: float) -> None:
         self._zoom_timer.stop()
@@ -1747,14 +1904,30 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
     def _pick_minimap_box(self) -> None:
         with mss.MSS() as sct:
-            mon = dict(sct.monitors[min(self._selected_monitor, len(sct.monitors) - 1)])
+            mon_idx = min(self._selected_monitor, len(sct.monitors) - 1)
+            mon = dict(sct.monitors[mon_idx])
+
+        # Match the Qt QScreen corresponding to this physical MSS monitor (handles 125%/150%/200% DPI scaling)
+        matched_screen = None
+        qt_app = QApplication.instance()
+        if qt_app is not None:
+            screens = qt_app.screens()
+            mw, mh = int(mon["width"]), int(mon["height"])
+            for scr in screens:
+                g = scr.geometry()
+                dpr = float(scr.devicePixelRatio()) or 1.0
+                if abs(int(round(g.width() * dpr)) - mw) <= 4 and abs(int(round(g.height() * dpr)) - mh) <= 4:
+                    matched_screen = scr
+                    break
+            if matched_screen is None and 0 <= mon_idx - 1 < len(screens):
+                matched_screen = screens[mon_idx - 1]
 
         def on_roi(roi: MinimapROI) -> None:
             self.tracker_mm.roi = roi
             save_roi(self.roi_path, roi)
             self.lbl_stats.setText(f"Saved Minimap ROI: ({roi.x0:.2f}, {roi.y0:.2f}) -> ({roi.x1:.2f}, {roi.y1:.2f})")
 
-        self._roi_overlay = QtROIPickerOverlay(mon, on_roi)
+        self._roi_overlay = QtROIPickerOverlay(mon, on_roi, screen=matched_screen)
         self._roi_overlay.show()
 
     def _undo_draw(self) -> None:
@@ -1955,11 +2128,50 @@ class ForeverNavigatorQtWindow(QMainWindow):
         elif self._transition_state is None:
             if self.chk_follow.isChecked():
                 self.pan_x, self.pan_y = float(est.map_px[0]), float(est.map_px[1])
+            self._maybe_stream_nearby_zones(est)
             self.lbl_dungeon.setText(f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]")
             if self.view_3d_mode:
                 self._render_3d_frame()
             else:
                 self.viewport.update()
+
+    def _maybe_stream_nearby_zones(self, est: TrackerEstimate) -> None:
+        """Auto-load any containing or adjacent WoW: Forever city/zone (e.g. Orgrimmar from Durotar)."""
+        if self.world_maps is None or est.position_confidence < 0.35:
+            return
+        now_t = time.perf_counter()
+        if now_t - getattr(self, "_last_nearby_check_t", 0.0) < 3.0:
+            return
+        self._last_nearby_check_t = now_t
+        active_entry = self.world_maps.get_entry(est.dungeon_slug)
+        if active_entry is None or not active_entry.minimap_folder:
+            return
+        wx, wy = float(est.world_pos[0]), float(est.world_pos[1])
+        folder = active_entry.minimap_folder
+        loading_set = getattr(self, "_nearby_loading", None)
+        if loading_set is None:
+            loading_set = set()
+            self._nearby_loading = loading_set
+        pad = 320.0
+        for e in self._all_map_entries:
+            if e.slug in self.tracker_3d.dungeons or e.slug in loading_set:
+                continue
+            if e.minimap_folder != folder or e.category not in ("Cities", "Zones") or e.bounds_xy is None:
+                continue
+            xmin, ymin, xmax, ymax = e.bounds_xy
+            if (xmin - pad) <= wx <= (xmax + pad) and (ymin - pad) <= wy <= (ymax + pad):
+                loading_set.add(e.slug)
+
+                def _load_nb(s: str = e.slug) -> None:
+                    try:
+                        d = self.world_maps.load_map(s, preview_only=True)
+                        if not self._closing and d is not None:
+                            self._ui_queue.put(("map_cached_register", (s, d)))
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_load_nb, daemon=True, name=f"QtNearby-{e.slug}").start()
+                break
 
     # --- UI Queue Drain ---
     def _drain_ui_queue(self) -> None:
@@ -2005,6 +2217,16 @@ class ForeverNavigatorQtWindow(QMainWindow):
                     self._fullres_uploaded_zones.add(slug)
                     self.viewport.queue_texture_upload(f"zone_{slug}", arr, build_mips=True)
                     needs_update = True
+            elif kind == "scene_3d_prepared":
+                slug, prepared, err = payload
+                if getattr(self, "_scene_3d_loading", None) == slug:
+                    self._scene_3d_loading = None
+                if err is not None or prepared is None:
+                    self._scene_3d_error = err or f"No 3D WMO model available for {slug}"
+                else:
+                    self._scene_3d_error = None
+                    self.viewport._pending_3d_scene = (slug, prepared)
+                needs_update = True
             elif kind == "map_cached_register":
                 slug, dungeon = payload
                 if dungeon is not None and slug not in self.tracker_3d.dungeons:
@@ -2184,6 +2406,7 @@ def run_qt_app(index_dir: str | Path = "data/index", fps: Optional[float] = None
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+    fmt.setDepthBufferSize(24)
     fmt.setSwapInterval(1)
     QSurfaceFormat.setDefaultFormat(fmt)
 

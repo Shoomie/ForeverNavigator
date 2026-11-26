@@ -212,6 +212,51 @@ class _LoadedGPUScene:
                 tex = mat_textures.get(b.material_id, default_tex)
                 self.draw_calls.append((vao, tex))
 
+    @classmethod
+    def from_prepared(
+        cls,
+        ctx: moderngl.Context,
+        prog: moderngl.Program,
+        default_tex: moderngl.Texture,
+        prepared: Dict[str, Any],
+    ) -> "_LoadedGPUScene":
+        """Upload CPU-prepared WMO geometry and decoded BLP textures onto an existing OpenGL context."""
+        obj = cls.__new__(cls)
+        obj.draw_calls = []
+        obj._buffers = []
+        obj._textures = []
+        obj.bbox_min = prepared["bbox_min"]
+        obj.bbox_max = prepared["bbox_max"]
+        obj.center = prepared["center"]
+        obj.radius = float(prepared["radius"])
+
+        tex_by_fdid: Dict[int, moderngl.Texture] = {}
+        for fdid, arr in prepared["textures"].items():
+            tex = ctx.texture((arr.shape[1], arr.shape[0]), 4, arr.tobytes())
+            tex.repeat_x = True
+            tex.repeat_y = True
+            tex.build_mipmaps()
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            tex_by_fdid[fdid] = tex
+            obj._textures.append(tex)
+
+        mat_to_fdid: Dict[int, int] = prepared["mat_to_fdid"]
+        for mesh in prepared["meshes"]:
+            vbo = ctx.buffer(mesh["vbo_bytes"])
+            obj._buffers.append(vbo)
+            for mat_id, ibo_bytes in mesh["batches"]:
+                ibo = ctx.buffer(ibo_bytes)
+                obj._buffers.append(ibo)
+                vao = ctx.vertex_array(
+                    prog,
+                    [(vbo, "3f 3f 2f 4f", "in_pos", "in_norm", "in_uv", "in_col")],
+                    index_buffer=ibo,
+                )
+                fdid = mat_to_fdid.get(mat_id)
+                tex = tex_by_fdid.get(fdid, default_tex) if fdid is not None else default_tex
+                obj.draw_calls.append((vao, tex))
+        return obj
+
     def release(self) -> None:
         for vao, _ in self.draw_calls:
             vao.release()
@@ -236,12 +281,15 @@ class GPU3DViewer:
 
         # Lazy-initialized OpenGL context & CASC reader (zero overhead until user toggles 3D!)
         self.ctx: Optional[moderngl.Context] = None
+        self._owns_ctx: bool = True
         self.prog: Optional[moderngl.Program] = None
         self.default_tex: Optional[moderngl.Texture] = None
         self._fbo: Optional[moderngl.Framebuffer] = None
         self._fbo_color: Optional[moderngl.Texture] = None
         self._fbo_depth: Optional[moderngl.Renderbuffer] = None
         self._fbo_size: Tuple[int, int] = (0, 0)
+        self._last_mvp: Optional[np.ndarray] = None
+        self._last_p3d: Optional[np.ndarray] = None
 
         self._casc: Optional[LocalCASC] = None
         self._id_to_path: Dict[int, str] = {}
@@ -601,22 +649,199 @@ class GPU3DViewer:
         )
         return canvas
 
-    def close(self) -> None:
+    def prepare_scene_cpu(self, slug: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Load & decode WMO geometry and BLP textures purely on CPU (safe for background threads)."""
+        fdid = DUNGEON_WMO_FDIDS.get(slug)
+        if fdid is None:
+            return None, "Outdoor BLP map (no single WMO 3D model) — use 2D Map view"
+        if not self._ensure_casc():
+            return None, self._error_msg or "Failed to open WoW CASC"
+        assert self._casc is not None
+        if not self._casc.has_file(fdid):
+            return None, f"WMO model FDID {fdid} not found in local {self.product} CASC"
+
+        root = parse_wmo_root(self._casc.read_file(fdid))
+        group_fdids = list(root.group_fdids)
+        if not group_fdids and fdid in self._id_to_path:
+            stem = self._id_to_path[fdid][:-4]
+            for gi in range(root.n_groups):
+                gp = f"{stem}_{gi:03d}.wmo".lower()
+                if gp in self._path_to_id:
+                    group_fdids.append(self._path_to_id[gp])
+
+        groups: List[WMOGroup] = []
+        for gi, gfdid in enumerate(group_fdids[:160]):
+            if gfdid == 0 or not self._casc.has_file(gfdid):
+                continue
+            try:
+                grp = parse_wmo_group(self._casc.read_file(gfdid), group_index=gi)
+                if grp is not None and len(grp.vertices) > 0 and len(grp.indices) >= 3:
+                    groups.append(grp)
+            except Exception:
+                continue
+
+        if not groups:
+            return None, "No 3D WMO groups could be loaded"
+
+        all_v = np.concatenate([g.vertices for g in groups], axis=0)
+        bbox_min = all_v.min(axis=0).astype(np.float32)
+        bbox_max = all_v.max(axis=0).astype(np.float32)
+        center = 0.5 * (bbox_min + bbox_max)
+        radius = float(np.linalg.norm(bbox_max - bbox_min) * 0.5)
+
+        textures: Dict[int, np.ndarray] = {}
+        mat_to_fdid: Dict[int, int] = {}
+        for mat_idx, mat in enumerate(root.materials):
+            t_fdid = resolve_material_texture(root, mat, self._path_to_id)
+            if t_fdid is None:
+                continue
+            mat_to_fdid[mat_idx] = t_fdid
+            if t_fdid in textures:
+                continue
+            try:
+                img = decode_blp(self._casc.read_file(t_fdid)).convert("RGBA")
+                if img.width > 256 or img.height > 256:
+                    img = img.resize((min(256, img.width), min(256, img.height)), Image.Resampling.BILINEAR)
+                textures[t_fdid] = np.ascontiguousarray(np.array(img, dtype=np.uint8))
+            except Exception:
+                continue
+
+        meshes: List[Dict[str, Any]] = []
+        for g in groups:
+            interleaved = np.hstack([g.vertices, g.normals, g.uvs, g.vertex_colors]).astype(np.float32)
+            batches = []
+            for b in g.batches:
+                sub_idx = g.indices[b.start_index : b.start_index + b.count]
+                if len(sub_idx) >= 3:
+                    batches.append((b.material_id, sub_idx.astype(np.uint32).tobytes()))
+            if batches:
+                meshes.append({"vbo_bytes": interleaved.tobytes(), "batches": batches})
+
+        return {
+            "bbox_min": bbox_min,
+            "bbox_max": bbox_max,
+            "center": center,
+            "radius": radius,
+            "textures": textures,
+            "mat_to_fdid": mat_to_fdid,
+            "meshes": meshes,
+        }, None
+
+    def upload_prepared_scene(self, ctx: moderngl.Context, slug: str, prepared: Dict[str, Any]) -> None:
+        """Upload a CPU-prepared scene onto a shared Qt/ModernGL context (must run on GL thread)."""
+        if self.ctx is None:
+            self.ctx = ctx
+            self._owns_ctx = False
+            self.prog = self.ctx.program(vertex_shader=VERT_SHADER, fragment_shader=FRAG_SHADER)
+            base = np.full((32, 32, 4), 165, dtype=np.uint8)
+            base[:, :, 3] = 255
+            self.default_tex = self.ctx.texture((32, 32), 4, base.tobytes())
         if self._scene is not None:
             self._scene.release()
             self._scene = None
+        assert self.prog is not None and self.default_tex is not None
+        self._scene = _LoadedGPUScene.from_prepared(self.ctx, self.prog, self.default_tex, prepared)
+        self._loaded_slug = slug
+        self._error_msg = None
+        self.target = self._scene.center.copy()
+
+    def render_direct_gl(
+        self,
+        ctx: moderngl.Context,
+        fbo: moderngl.Framebuffer,
+        slug: str,
+        d: DungeonData,
+        width: int,
+        height: int,
+        player_world: Optional[np.ndarray] = None,
+        follow_player: bool = True,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Render the loaded 3D WMO directly into an existing QOpenGLWidget FBO (zero context switch, zero readback)."""
+        if self._scene is None or self._loaded_slug != slug or self.prog is None:
+            self._last_mvp = None
+            self._last_p3d = None
+            return None, None
+        scene = self._scene
+        if self.target is None:
+            self.target = scene.center.copy()
+
+        p3d: Optional[np.ndarray] = None
+        if player_world is not None:
+            pz = self.snap_world_z(d, player_world[:2], prefer_z=self._last_player_z)
+            self._last_player_z = pz
+            p3d = np.array([float(player_world[0]), float(player_world[1]), pz], dtype=np.float32)
+            if follow_player:
+                self.target = p3d.copy()
+
+        yaw = math.radians(self.yaw_deg)
+        pitch = math.radians(self.pitch_deg)
+        dist = max(18.0, (scene.radius * 1.95) / max(0.30, self.zoom))
+        cam_dir = np.array(
+            [math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), math.sin(pitch)],
+            dtype=np.float32,
+        )
+        eye = self.target + cam_dir * dist
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        view = Matrix44.look_at(eye, self.target, up, dtype="f4")
+        proj = Matrix44.perspective_projection(55.0, width / float(max(1, height)), 0.5, 2500.0, dtype="f4")
+        mvp = proj * view
+
+        fbo.use()
+        ctx.enable(moderngl.DEPTH_TEST)
+        fbo.clear(0.07, 0.08, 0.11, 1.0, depth=1.0)
+        self.prog["u_mvp"].write(mvp.astype("f4").tobytes())
+        self.prog["u_cutaway"].value = 1 if self.cutaway_ceilings else 0
+        self.prog["u_brightness"].value = float(self.brightness)
+        self.prog["u_tex"].value = 0
+
+        for vao, tex in scene.draw_calls:
+            tex.use(location=0)
+            vao.render()
+
+        ctx.disable(moderngl.DEPTH_TEST)
+        mvp_mat = np.array(mvp, dtype=np.float32)
+        self._last_mvp = mvp_mat
+        self._last_p3d = p3d
+        return mvp_mat, p3d
+
+    def release_gl_only(self) -> None:
+        """Release GPU buffers/textures without releasing a shared external OpenGL context."""
+        if self._scene is not None:
+            try:
+                self._scene.release()
+            except Exception:
+                pass
+            self._scene = None
         if self._fbo is not None:
-            self._fbo.release()
-            self._fbo_color.release()
-            self._fbo_depth.release()
+            try:
+                self._fbo.release()
+                self._fbo_color.release()
+                self._fbo_depth.release()
+            except Exception:
+                pass
             self._fbo = None
         if self.default_tex is not None:
-            self.default_tex.release()
+            try:
+                self.default_tex.release()
+            except Exception:
+                pass
+            self.default_tex = None
         if self.prog is not None:
-            self.prog.release()
-        if self.ctx is not None:
-            self.ctx.release()
-            self.ctx = None
+            try:
+                self.prog.release()
+            except Exception:
+                pass
+            self.prog = None
+        if self._owns_ctx and self.ctx is not None:
+            try:
+                self.ctx.release()
+            except Exception:
+                pass
+        self.ctx = None
+
+    def close(self) -> None:
+        self.release_gl_only()
         if self._casc is not None:
             self._casc.close()
             self._casc = None

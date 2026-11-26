@@ -149,6 +149,7 @@ class MinimapTracker:
         self._coarse_valid: Dict[str, np.ndarray] = {}
         self._scale_ratio: Dict[str, float] = {}
         self._coarse_ratio: Dict[str, float] = {}
+        self._is_outdoor_zone: Dict[str, bool] = {}
 
         if not self.lazy_precompute:
             for slug, d in self.dungeons.items():
@@ -162,8 +163,11 @@ class MinimapTracker:
         # Smoothed position in original map pixels + motion-plausibility / teleport confirmation state
         self._smooth_px: Optional[np.ndarray] = None
         self._last_update_t: Optional[float] = None
+        self._last_loading_screen_t: Optional[float] = None
         self._jump_cand_px: Optional[np.ndarray] = None
         self._jump_confirm_count: int = 0
+        self._switch_cand_slug: Optional[str] = None
+        self._switch_confirm_count: int = 0
         self.trail_px: List[Tuple[int, int]] = []
         self.last_crop_rgb: Optional[np.ndarray] = None
         self._frame_count: int = 0
@@ -233,9 +237,9 @@ class MinimapTracker:
                 w_sz, c_sz = min(img_h, 512), min(img_h, 160)
         else:
             if span_yards > 2500.0:
-                w_sz, c_sz = min(img_h, 512), min(img_h, 256)
+                w_sz, c_sz = min(img_h, 1024), min(img_h, 256)
             elif span_yards > 900.0:
-                w_sz, c_sz = min(img_h, 384), min(img_h, 192)
+                w_sz, c_sz = min(img_h, 512), min(img_h, 192)
             else:
                 w_sz, c_sz = min(img_h, max(self.map_work_size, 256)), min(img_h, self.coarse_size)
 
@@ -251,11 +255,11 @@ class MinimapTracker:
         c_valid = cv2.dilate((c_lum > 0.11).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         ratio_c = orig_h / float(c_sz)
 
-        # Restrict valid match centers to the zone's actual world bounds_xy (+80yd border)
+        # Restrict valid match centers to the zone's actual world bounds_xy (+120yd border)
         # so padded square zone maps don't steal matches from neighboring zones!
         if d.bounds_xy is not None:
             xmin, ymin, xmax, ymax = d.bounds_xy
-            pad = 80.0
+            pad = 120.0
             p0 = d.world_to_map_px(np.array([xmin - pad, ymin - pad]))
             p1 = d.world_to_map_px(np.array([xmax + pad, ymax + pad]))
             bx0, bx1 = max(0, min(p0[0], p1[0])), min(orig_h, max(p0[0], p1[0]) + 1)
@@ -279,6 +283,38 @@ class MinimapTracker:
             self._coarse_ratio[slug] = ratio_c
             self._valid_center[slug] = valid
             self._coarse_valid[slug] = c_valid
+            self._is_outdoor_zone[slug] = bool(d.bounds_xy is not None)
+
+    def upgrade_zone_resolution(self, slug: str, img_rgb: np.ndarray, max_work_px: int = 1024) -> None:
+        """Upgrade the working structural channels of an active zone from a higher-res image (thread-safe)."""
+        d = self.dungeons.get(slug)
+        if d is None or img_rgb is None or img_rgb.ndim != 3:
+            return
+        orig_h = int(d.map_size_px)
+        w_sz = min(int(img_rgb.shape[0]), max_work_px)
+        if slug in self._map_sil and self._map_sil[slug].shape[0] >= w_sz:
+            return
+        small = cv2.resize(img_rgb, (w_sz, w_sz), interpolation=cv2.INTER_AREA) if img_rgb.shape[0] != w_sz else img_rgb
+        rgb_f, edge = extract_structural_channels(small, is_floorplan=True)
+        lum = rgb_f.mean(axis=-1)
+        valid = cv2.dilate((lum > 0.11).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+        ratio_f = orig_h / float(w_sz)
+        if d.bounds_xy is not None:
+            xmin, ymin, xmax, ymax = d.bounds_xy
+            pad = 120.0
+            p0 = d.world_to_map_px(np.array([xmin - pad, ymin - pad]))
+            p1 = d.world_to_map_px(np.array([xmax + pad, ymax + pad]))
+            bx0, bx1 = max(0, min(p0[0], p1[0])), min(orig_h, max(p0[0], p1[0]) + 1)
+            by0, by1 = max(0, min(p0[1], p1[1])), min(orig_h, max(p0[1], p1[1]) + 1)
+            f_mask = np.zeros_like(valid, dtype=bool)
+            f_mask[int(by0 / ratio_f) : int(np.ceil(by1 / ratio_f)), int(bx0 / ratio_f) : int(np.ceil(bx1 / ratio_f))] = True
+            valid = valid & f_mask
+        with self._lock:
+            self._map_sil[slug] = rgb_f
+            self._map_edge[slug] = edge
+            self._scale_ratio[slug] = ratio_f
+            self._valid_center[slug] = valid
+            self._is_outdoor_zone[slug] = bool(d.bounds_xy is not None)
 
     def _ensure_precomputed(self, slug: str) -> None:
         if slug in self._map_sil:
@@ -312,8 +348,11 @@ class MinimapTracker:
             self.dungeon_probs = np.full(n_d, 1.0 / max(1, n_d), dtype=np.float64)
             self._smooth_px = None
             self._last_update_t = None
+            self._last_loading_screen_t = None
             self._jump_cand_px = None
             self._jump_confirm_count = 0
+            self._switch_cand_slug = None
+            self._switch_confirm_count = 0
             self.trail_px.clear()
 
     def _match_single_dungeon(
@@ -476,6 +515,9 @@ class MinimapTracker:
         lit_frac = float((inner_sq.mean(axis=-1) > 18.0).mean())
         min_lit = 0.02 if (self.locked_dungeon_slug and self.is_shared_map(self.locked_dungeon_slug)) else 0.05
         if lit_frac < min_lit:
+            self._last_loading_screen_t = time.perf_counter()
+            self._switch_cand_slug = None
+            self._switch_confirm_count = 0
             slug = self.locked_dungeon_slug or self.active_slug
             d = self.dungeons[slug]
             px = (
@@ -656,28 +698,63 @@ class MinimapTracker:
                 post /= post.sum() + 1e-12
                 best_slug = order[int(np.argmax(post))]
                 best_raw = float(raw_scores.get(best_slug, 0.0))
-                # Guard against un-indexed indoor caves / noisy low-confidence frames causing false zone jumps
-                hold_indoor_cave = (
-                    dark_void_frac > 0.50
-                    and best_raw < 0.48
+                active_raw = float(raw_scores.get(active_slug, 0.0))
+                active_is_outdoor = self._is_outdoor_zone.get(active_slug, False)
+                cand_is_outdoor = self._is_outdoor_zone.get(best_slug, False)
+                recent_loading = (
+                    self._last_loading_screen_t is not None
+                    and (now_t - self._last_loading_screen_t) <= 15.0
+                )
+
+                # Guard 1: Outdoor tunnel/cave/building protection.
+                # Walking into an indoor WMO tunnel (e.g. Orgrimmar gate tunnel, Feralas cave) turns the
+                # minimap into a dark-void corridor that spuriously matches black-void dungeon floorplans
+                # (Zul'Farrak, Razorfen Kraul, Scholomance, etc.). In WoW, you cannot enter an instanced
+                # dungeon from an outdoor zone without a loading screen!
+                hold_outdoor_tunnel = (
+                    active_is_outdoor
                     and self._smooth_px is not None
                     and active_slug in self.dungeons
+                    and (
+                        (dark_void_frac > 0.28 and not cand_is_outdoor and not recent_loading)
+                        or (dark_void_frac > 0.45 and best_raw < 0.52)
+                    )
                 )
-                hold_weak_switch = (
-                    best_slug != active_slug
-                    and best_raw < 0.40
-                    and self._smooth_px is not None
-                    and active_slug in self.dungeons
-                )
-                if hold_indoor_cave or hold_weak_switch:
+
+                # Guard 2: Weak-match & multi-frame switch hysteresis (prevents 1-frame zone ping-pong).
+                hold_switch = False
+                if not hold_outdoor_tunnel and best_slug != active_slug and self._smooth_px is not None and active_slug in self.dungeons:
+                    if best_raw < 0.42:
+                        hold_switch = True
+                    else:
+                        # Switching outdoor -> instanced dungeon without a loading screen needs 3 consecutive frames
+                        need_frames = 3 if (active_is_outdoor and not cand_is_outdoor and not recent_loading) else 2
+                        # Unmistakable outdoor-to-outdoor or post-loading-screen lock can switch faster
+                        unmistakable = (
+                            recent_loading
+                            or (cand_is_outdoor and best_raw >= 0.72 and best_raw >= active_raw + 0.20)
+                        )
+                        if not unmistakable:
+                            if self._switch_cand_slug == best_slug:
+                                self._switch_confirm_count += 1
+                            else:
+                                self._switch_cand_slug = best_slug
+                                self._switch_confirm_count = 1
+                            if self._switch_confirm_count < need_frames:
+                                hold_switch = True
+
+                if hold_outdoor_tunnel or hold_switch:
                     best_slug = active_slug
-                elif len(self.dungeon_order) == len(order):
-                    self.dungeon_probs = post
                 else:
-                    padded = np.full(len(self.dungeon_order), 1.0 / len(self.dungeon_order), dtype=np.float64)
-                    padded[: len(order)] = post * (len(order) / float(len(self.dungeon_order)))
-                    padded /= padded.sum() + 1e-12
-                    self.dungeon_probs = padded
+                    self._switch_cand_slug = None
+                    self._switch_confirm_count = 0
+                    if len(self.dungeon_order) == len(order):
+                        self.dungeon_probs = post
+                    else:
+                        padded = np.full(len(self.dungeon_order), 1.0 / len(self.dungeon_order), dtype=np.float64)
+                        padded[: len(order)] = post * (len(order) / float(len(self.dungeon_order)))
+                        padded /= padded.sum() + 1e-12
+                        self.dungeon_probs = padded
             probs_snapshot = self.dungeon_probs.copy()
             order_snapshot = list(self.dungeon_order)
 
@@ -686,6 +763,8 @@ class MinimapTracker:
             self._smooth_px = None
             self._jump_cand_px = None
             self._jump_confirm_count = 0
+            self._switch_cand_slug = None
+            self._switch_confirm_count = 0
             self.trail_px.clear()
 
         d = self.dungeons[best_slug]
@@ -695,8 +774,15 @@ class MinimapTracker:
         ratio = self._scale_ratio[best_slug]
         raw_px = np.array([wx * ratio, wy * ratio], dtype=np.float32)
 
-        # If inside an un-indexed dark cave with weak match, hold last known outdoor position
-        if not (locked_slug and locked_slug in self.dungeons) and dark_void_frac > 0.50 and raw_scores.get(best_slug, 0.0) < 0.48 and self._smooth_px is not None:
+        # If inside an un-indexed dark tunnel/cave while in an outdoor zone, hold last known outdoor position
+        if (
+            not (locked_slug and locked_slug in self.dungeons)
+            and self._smooth_px is not None
+            and (
+                (dark_void_frac > 0.28 and self._is_outdoor_zone.get(best_slug, False) and raw_scores.get(best_slug, 0.0) < 0.45)
+                or (dark_void_frac > 0.50 and raw_scores.get(best_slug, 0.0) < 0.48)
+            )
+        ):
             raw_px = self._smooth_px.copy()
 
         # High-precision full-resolution local refinement on native map pixels (only when full-res image is resident)
