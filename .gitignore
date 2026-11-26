@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+data/minimap_roi.json
+data/settings.json
+data/sessions/
+data/dev_gameplay/
+data/logs/
+data/cache/
+data/listfile.csv
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

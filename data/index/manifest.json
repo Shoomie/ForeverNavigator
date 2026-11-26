@@ -1,0 +1,312 @@
+{
+  "encoder_onnx": "encoder.onnx",
+  "dungeons": [
+    {
+      "slug": "ruins_of_lordaeron_courtyard",
+      "name": "Ruins of Lordaeron (Courtyard)",
+      "file": "ruins_of_lordaeron_courtyard.npz",
+      "combatlog_keywords": [
+        "ruins of lordaeron",
+        "lordaeron"
+      ]
+    },
+    {
+      "slug": "ahnqiraj_ruins",
+      "name": "Ruins of Ahn'Qiraj (AQ20)",
+      "file": "ahnqiraj_ruins.npz",
+      "combatlog_keywords": [
+        "ruins of ahn'qiraj",
+        "kurinnaxx",
+        "ossirian"
+      ]
+    },
+    {
+      "slug": "ahnqiraj_temple",
+      "name": "Temple of Ahn'Qiraj (AQ40)",
+      "file": "ahnqiraj_temple.npz",
+      "combatlog_keywords": [
+        "ahn'qiraj",
+        "c'thun",
+        "skeram",
+        "huhuran"
+      ]
+    },
+    {
+      "slug": "blackwing_lair",
+      "name": "Blackwing Lair",
+      "file": "blackwing_lair.npz",
+      "combatlog_keywords": [
+        "blackwing lair",
+        "razorgore",
+        "vaelastrasz",
+        "nefarian"
+      ]
+    },
+    {
+      "slug": "deadmines",
+      "name": "The Deadmines",
+      "file": "deadmines.npz",
+      "combatlog_keywords": [
+        "deadmines",
+        "vancleef",
+        "rhahk'zor",
+        "mr. smite"
+      ]
+    },
+    {
+      "slug": "scarlet_monastery",
+      "name": "Scarlet Monastery",
+      "file": "scarlet_monastery.npz",
+      "combatlog_keywords": [
+        "scarlet monastery",
+        "herod",
+        "whitemane",
+        "mograine",
+        "doan"
+      ]
+    },
+    {
+      "slug": "razorfen_downs",
+      "name": "Razorfen Downs",
+      "file": "razorfen_downs.npz",
+      "combatlog_keywords": [
+        "razorfen downs",
+        "amnennar",
+        "tuten'kash"
+      ]
+    },
+    {
+      "slug": "razorfen_kraul",
+      "name": "Razorfen Kraul",
+      "file": "razorfen_kraul.npz",
+      "combatlog_keywords": [
+        "razorfen kraul",
+        "charlga",
+        "roogug"
+      ]
+    },
+    {
+      "slug": "scholomance",
+      "name": "Scholomance",
+      "file": "scholomance.npz",
+      "combatlog_keywords": [
+        "scholomance",
+        "gandling",
+        "ras frostwhisper",
+        "kirtonos"
+      ]
+    },
+    {
+      "slug": "shadowfang_keep",
+      "name": "Shadowfang Keep",
+      "file": "shadowfang_keep.npz",
+      "combatlog_keywords": [
+        "shadowfang",
+        "arugal",
+        "fenrus",
+        "razorclaw"
+      ]
+    },
+    {
+      "slug": "stratholme",
+      "name": "Stratholme",
+      "file": "stratholme.npz",
+      "combatlog_keywords": [
+        "stratholme",
+        "rivendare",
+        "balnazzar",
+        "ramstein"
+      ]
+    },
+    {
+      "slug": "naxxramas",
+      "name": "Naxxramas",
+      "file": "naxxramas.npz",
+      "combatlog_keywords": [
+        "naxxramas",
+        "kel'thuzad",
+        "patchwerk",
+        "anub'rekhan",
+        "sapphiron"
+      ]
+    },
+    {
+      "slug": "zul_farrak",
+      "name": "Zul'Farrak",
+      "file": "zul_farrak.npz",
+      "combatlog_keywords": [
+        "zul'farrak",
+        "gahz'rilla",
+        "chief ukorz"
+      ]
+    },
+    {
+      "slug": "zul_gurub",
+      "name": "Zul'Gurub",
+      "file": "zul_gurub.npz",
+      "combatlog_keywords": [
+        "zul'gurub",
+        "hakkar",
+        "mandokir",
+        "thekal",
+        "venoxis"
+      ]
+    },
+    {
+      "slug": "ragefire_chasm",
+      "name": "Ragefire Chasm",
+      "file": "ragefire_chasm.npz",
+      "combatlog_keywords": [
+        "ragefire chasm",
+        "oggflint",
+        "taragaman",
+        "jergosh",
+        "bazzalan"
+      ]
+    },
+    {
+      "slug": "ruins_of_lordaeron",
+      "name": "Ruins of Lordaeron / Undercity",
+      "file": "ruins_of_lordaeron.npz",
+      "combatlog_keywords": [
+        "ruins of lordaeron",
+        "undercity",
+        "royal quarter"
+      ]
+    },
+    {
+      "slug": "stockade",
+      "name": "The Stockade",
+      "file": "stockade.npz",
+      "combatlog_keywords": [
+        "stockade",
+        "bazil thredd",
+        "kam deepfury"
+      ]
+    },
+    {
+      "slug": "blackfathom_deeps",
+      "name": "Blackfathom Deeps",
+      "file": "blackfathom_deeps.npz",
+      "combatlog_keywords": [
+        "blackfathom deeps",
+        "aku'mai",
+        "kelris",
+        "ghamoo-ra"
+      ]
+    },
+    {
+      "slug": "blackrock_depths",
+      "name": "Blackrock Depths",
+      "file": "blackrock_depths.npz",
+      "combatlog_keywords": [
+        "blackrock depths",
+        "thaurissan",
+        "angerforge",
+        "bael'gar"
+      ]
+    },
+    {
+      "slug": "blackrock_spire",
+      "name": "Blackrock Spire (LBRS/UBRS)",
+      "file": "blackrock_spire.npz",
+      "combatlog_keywords": [
+        "blackrock spire",
+        "drakkisath",
+        "rend blackhand",
+        "wyrmthalak"
+      ]
+    },
+    {
+      "slug": "molten_core",
+      "name": "Molten Core",
+      "file": "molten_core.npz",
+      "combatlog_keywords": [
+        "molten core",
+        "ragnaros",
+        "lucifron",
+        "magmadar",
+        "baron geddon",
+        "garr"
+      ]
+    },
+    {
+      "slug": "dire_maul",
+      "name": "Dire Maul",
+      "file": "dire_maul.npz",
+      "combatlog_keywords": [
+        "dire maul",
+        "gordok",
+        "immol'thar",
+        "alzzin",
+        "tendris"
+      ]
+    },
+    {
+      "slug": "gnomeregan",
+      "name": "Gnomeregan",
+      "file": "gnomeregan.npz",
+      "combatlog_keywords": [
+        "gnomeregan",
+        "thermaplugg",
+        "crowd pummeler",
+        "viscous fallout"
+      ]
+    },
+    {
+      "slug": "maraudon",
+      "name": "Maraudon",
+      "file": "maraudon.npz",
+      "combatlog_keywords": [
+        "maraudon",
+        "theradras",
+        "celebras",
+        "landslide",
+        "rotgrip"
+      ]
+    },
+    {
+      "slug": "onyxias_lair",
+      "name": "Onyxia's Lair",
+      "file": "onyxias_lair.npz",
+      "combatlog_keywords": [
+        "onyxia's lair",
+        "onyxia"
+      ]
+    },
+    {
+      "slug": "sunken_temple",
+      "name": "Sunken Temple",
+      "file": "sunken_temple.npz",
+      "combatlog_keywords": [
+        "sunken temple",
+        "atal'hakkar",
+        "eranikus",
+        "jammal'an"
+      ]
+    },
+    {
+      "slug": "uldaman",
+      "name": "Uldaman",
+      "file": "uldaman.npz",
+      "combatlog_keywords": [
+        "uldaman",
+        "archaedas",
+        "ironaya",
+        "revelosh"
+      ]
+    },
+    {
+      "slug": "wailing_caverns",
+      "name": "Wailing Caverns",
+      "file": "wailing_caverns.npz",
+      "combatlog_keywords": [
+        "wailing caverns",
+        "cobrahn",
+        "anacondra",
+        "mutanus",
+        "verdan"
+      ]
+    }
+  ]
+}
