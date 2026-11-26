@@ -57,20 +57,21 @@ Raiders' Windows system clocks can drift by several seconds, which would ruin sy
 
 ---
 
-## 5. Multi-Floor & Navigation Robustness
+## 5. Hybrid Neural + Geometric Localization & 3D Rendering
 
-- **Baseline Localization (`src/navigator/`)**: Native `1024×1024` Blizzard minimap tiles (`World/Minimaps/` & `World/Minimaps/WMO/`) with exact North-Up orientation, 3-channel RGB + edge matching, **motion-plausibility radius** ($R = \max(24, 18\Delta t + 12)$ yd), and **2-frame teleport/summon confirmation**.
-- **GPU 3D Model View**: On-demand ModernGL `.wmo` + `.blp` rendering directly from each user's local WoW folder (zero Blizzard asset redistribution) with ceiling cutaway and Z-floor continuity.
-- **Future Google Colab A100 Enhancements**:
-  1. **Sim-to-Real 3D Visual Relocalizer**: Distill `DINOv2` -> `MobileNetV3-Small` INT8 ONNX to resolve floor-level ambiguity in stacked multi-floor raids (*Naxxramas, Blackrock Spire, Sunken Temple, Gnomeregan*).
-  2. **Automatic Wipe / Mechanic Bookmarker**: Lightweight vision tagger trained on synthetic WoW frames to auto-tag timeline moments (*raid-wide AoE, wipe pull, boss enrage*) for instant officer scrubbing.
+- **Fast Passive Capture (`src/navigator/fast_capture.py`)**: Windows DXGI Desktop Duplication (`dxcam`) delivers ~1–2 ms ROI captures for `30–60 Hz` polling, with seamless `mss` fallback on Linux/headless environments.
+- **Hybrid Neural ONNX + OpenCV Tracker (`src/navigator/neural_localizer.py`, `src/navigator/minimap_tracker.py`)**:
+  - **Multi-Task ONNX Models (`data/models/`)**: Trained on a globally-shuffled, full-resolution synthetic dataset (`1024×1024` native dungeon/raid maps + up to `4096×4096` CASC outdoor mosaics on Colab A100-80GB). Predicts zone/dungeon class (82 classes), normalized `(u, v)` coordinates, minimap auto-centering `(cx, cy, r)`, and 360° player arrow heading in ~4–8 ms on CPU (`MobileNetV3-Large`, ~18 MB) with optional higher-capacity backbones (`ConvNeXt-Tiny`) hot-swappable live in the UI.
+  - **Geometric Refinement & Stability Guardrails**: Tight local-patch OpenCV refinement around the neural prior, togglable periodic full-map OpenCV anchor (`~2.5s`), cave/tunnel uncertainty hold, geographic continuity guard (prevents cross-continent jumps without a loading screen), motion-plausibility radius ($R = \max(24, 18\Delta t + 12)$ yd), and 2-frame teleport/summon confirmation.
+- **GPU 2D/3D Viewport (`src/ui/qt_app.py`, `src/navigator/gpu_viewer3d.py`)**: PySide6 + ModernGL renderer with a separated transparent `_MapOverlayWidget` (preventing `QPainter` from corrupting GL state) and shared-context on-demand `.wmo` + `.blp` 3D rendering directly from each user's local WoW folder (zero Blizzard asset redistribution), with async CPU scene prep and ceiling cutaway.
+- **Offline Calibration & LLM Surgical Tuning (`src/navigator/calibration_pipeline.py`, `src/navigator/model_tuning_pipeline.py`)**: Evaluates models head-to-head on recorded gameplay holdout logs + synthetic ground truth, inspects ONNX classifier/regression head weights and ECE calibration, and supports non-destructive surgical head patching (temperature scaling, per-class bias nudges, regression offsets).
 
 ---
 
 ## 6. Blizzard ToS Safety Invariants
 
 All ForeverNavigator modules must strictly uphold four non-negotiable invariants:
-1. **Passive External Observation Only**: Uses standard OS screen capture (`mss`) and standard text log files (`WoWCombatLog-*.txt`).
+1. **Passive External Observation Only**: Uses standard OS screen capture (`dxcam` / `mss`) and standard text log files (`WoWCombatLog-*.txt`).
 2. **Zero Memory Access / Injection**: Never reads/writes `Wow.exe` memory or hooks DirectX/OpenGL.
 3. **Zero Input Automation**: Never sends synthetic keystrokes, clicks, or movement commands.
 4. **Zero Hidden Information**: Never reveals stealth, unrendered mobs, or server-only state.
