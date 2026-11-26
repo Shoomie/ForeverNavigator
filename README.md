@@ -1,5 +1,7 @@
 # ForeverNavigator
 
+DISCLAIMER: This project is very new, and i'm not a professional data analyst. There will be bugs and quirks, but the project is in active development and i would appreciate any feedback or bug reports.
+
 A lightweight, ToS-safe, collaborative **2D/3D Raid Navigator, Tactical Whiteboard, Combat Log Analytics, and Synced Multi-Track Replay** framework for *World of Warcraft: Forever* (and Classic/Era).
 
 Built on top of the `MapNavigate` 28-dungeon native `1024×1024` minimap & GPU 3D WMO engine.
