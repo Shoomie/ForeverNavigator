@@ -7,6 +7,7 @@ overlays, achieving 120+ FPS pan & smooth cursor-anchored stepless zoom with <1%
 
 from __future__ import annotations
 
+import math
 import queue
 import sys
 import threading
@@ -21,12 +22,12 @@ import numpy as np
 from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
-    QBrush,
     QColor,
     QFont,
+    QFontMetrics,
+    QImage,
     QMouseEvent,
     QPainter,
-    QPainterPath,
     QPen,
     QSurfaceFormat,
     QWheelEvent,
@@ -193,38 +194,383 @@ void main() {
 }
 """
 
+_CIRCLE_VERT = """
+#version 330 core
+in vec2 in_pos;
+uniform vec4 u_rect;     // (x0, y0, x1, y1) in NDC [-1..1]
+out vec2 v_local;        // [-1..1] across quad
+void main() {
+    vec2 p = mix(u_rect.xy, u_rect.zw, in_pos);
+    gl_Position = vec4(p, 0.0, 1.0);
+    v_local = in_pos * 2.0 - 1.0;
+}
+"""
+
+_CIRCLE_FRAG = """
+#version 330 core
+in vec2 v_local;
+uniform vec4 u_fill;
+uniform vec4 u_stroke;
+uniform float u_outer_px;
+uniform float u_stroke_px;
+uniform int u_dashed;
+out vec4 fragColor;
+void main() {
+    float dist_px = length(v_local) * u_outer_px;
+    float aa = 1.0;
+    float outer_alpha = 1.0 - smoothstep(u_outer_px - aa, u_outer_px + aa * 0.5, dist_px);
+    if (outer_alpha <= 0.001) {
+        discard;
+    }
+    float inner_r = max(0.0, u_outer_px - u_stroke_px);
+    float stroke_mask = smoothstep(inner_r - aa, inner_r + aa * 0.5, dist_px);
+    if (u_dashed == 1) {
+        float ang = atan(v_local.y, v_local.x);
+        float dash_count = max(12.0, floor(u_outer_px * 0.45));
+        float phase = fract((ang / 6.2831853 + 0.5) * dash_count);
+        float dash_mask = smoothstep(0.0, 0.08, phase) * (1.0 - smoothstep(0.55, 0.63, phase));
+        stroke_mask *= dash_mask;
+    }
+    vec4 col = mix(u_fill, u_stroke, stroke_mask);
+    col.a *= outer_alpha;
+    if (col.a <= 0.001) {
+        discard;
+    }
+    fragColor = col;
+}
+"""
+
+_LINE_VERT = """
+#version 330 core
+in vec2 in_pos;          // NDC xy
+in vec4 in_col;          // RGBA
+in vec2 in_edge;         // (signed_perp_px, half_width_px)
+in vec2 in_dash;         // (along_px, dash_period_px; 0 = solid)
+out vec4 v_col;
+out vec2 v_edge;
+out vec2 v_dash;
+void main() {
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+    v_col = in_col;
+    v_edge = in_edge;
+    v_dash = in_dash;
+}
+"""
+
+_LINE_FRAG = """
+#version 330 core
+in vec4 v_col;
+in vec2 v_edge;
+in vec2 v_dash;
+out vec4 fragColor;
+void main() {
+    float d = abs(v_edge.x);
+    float hw = v_edge.y;
+    float alpha = 1.0 - smoothstep(max(0.0, hw - 0.75), hw + 0.75, d);
+    if (v_dash.y > 0.5) {
+        float phase = fract(v_dash.x / v_dash.y);
+        alpha *= step(phase, 0.58);
+    }
+    if (alpha * v_col.a <= 0.001) {
+        discard;
+    }
+    fragColor = vec4(v_col.rgb, v_col.a * alpha);
+}
+"""
+
 
 def _role_badge(role: str) -> str:
     r = (role or "DPS").upper()
     return {"LEADER": "L", "OFFICER": "O", "TANK": "T", "HEALER": "H"}.get(r, "D")
 
 
-class _MapOverlayWidget(QWidget):
-    """Transparent vector overlay child widget composited cleanly on top of GPUMapViewport.
+def _to_rgba_u8(arr: np.ndarray) -> np.ndarray:
+    """Convert RGB/RGBA/Gray uint8 image to contiguous HxWx4 RGBA for zero-repack GPU texture upload."""
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        return np.ascontiguousarray(arr, dtype=np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return np.ascontiguousarray(cv2.cvtColor(arr, cv2.COLOR_RGB2RGBA), dtype=np.uint8)
+    return np.ascontiguousarray(cv2.cvtColor(arr, cv2.COLOR_GRAY2RGBA), dtype=np.uint8)
 
-    Keeping QPainter on a child overlay widget prevents Qt's QOpenGL2PaintEngineEx from
-    mutating OpenGL state behind ModernGL's back (which otherwise leaves ModernGL's cached
-    VAO/program bindings stale and renders blank frames after the first QPainter pass).
+
+_COLOR_CACHE: Dict[str, Tuple[float, float, float, float]] = {}
+
+
+def _hex_to_rgba_f(hex_color: str, alpha: float = 1.0) -> Tuple[float, float, float, float]:
+    key = hex_color if alpha == 1.0 else f"{hex_color}:{alpha:.2f}"
+    cached = _COLOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    qc = QColor(hex_color)
+    if not qc.isValid():
+        res = (1.0, 0.35, 0.27, alpha)
+    else:
+        res = (qc.redF(), qc.greenF(), qc.blueF(), alpha * qc.alphaF())
+    _COLOR_CACHE[key] = res
+    return res
+
+
+class _GPUOverlayRenderer:
+    """Pure ModernGL 2D overlay renderer (circles, lines, polylines, LRU-cached crisp text quads).
+
+    Renders all 2D/3D vector overlays directly in ModernGL without touching QOpenGLWidget with
+    QPainter (preserving Qt+ModernGL isolation) and without a translucent child QWidget (which
+    otherwise costs 8-25 ms/frame in full-viewport CPU backing-store uploads on Windows).
     """
 
-    def __init__(self, viewport: "GPUMapViewport"):
-        super().__init__(viewport)
-        self._viewport = viewport
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAutoFillBackground(False)
+    def __init__(self, ctx: Any, quad_prog: Any, quad_vao: Any, quad_vbo: Any):
+        self.ctx = ctx
+        self._quad_prog = quad_prog
+        self._quad_vao = quad_vao
+        self._circle_prog = ctx.program(vertex_shader=_CIRCLE_VERT, fragment_shader=_CIRCLE_FRAG)
+        self._circle_vao = ctx.vertex_array(self._circle_prog, [(quad_vbo, "2f 2x4", "in_pos")])
+        self._line_prog = ctx.program(vertex_shader=_LINE_VERT, fragment_shader=_LINE_FRAG)
+        self._line_vbo_cap = 4096 * 10 * 4  # initial 160 KB dynamic buffer
+        self._line_vbo = ctx.buffer(reserve=self._line_vbo_cap, dynamic=True)
+        self._line_vao = ctx.vertex_array(
+            self._line_prog,
+            [(self._line_vbo, "2f 4f 2f 2f", "in_pos", "in_col", "in_edge", "in_dash")],
+        )
+        self._line_verts: List[float] = []
+        self._labels: OrderedDict[Tuple[str, int, bool, str, bool, int], Tuple[Any, float, float]] = OrderedDict()
+        self._label_cap = 256
 
-    def paintEvent(self, _event) -> None:
-        cw = float(max(1, self.width()))
-        ch = float(max(1, self.height()))
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        self._viewport._paint_overlays(painter, cw, ch)
-        painter.end()
+    def release(self) -> None:
+        for tex, _, _ in self._labels.values():
+            try:
+                tex.release()
+            except Exception:
+                pass
+        self._labels.clear()
+        for obj in (self._circle_vao, self._circle_prog, self._line_vao, self._line_vbo, self._line_prog):
+            if obj is not None:
+                try:
+                    obj.release()
+                except Exception:
+                    pass
+
+    def begin_lines(self) -> None:
+        self._line_verts.clear()
+
+    def add_line(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        cw: float,
+        ch: float,
+        rgba: Tuple[float, float, float, float],
+        width_px: float = 2.0,
+        dash_px: float = 0.0,
+        along_offset: float = 0.0,
+    ) -> float:
+        dx = x1 - x0
+        dy = y1 - y0
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-4:
+            return along_offset
+        hw = max(0.5, width_px * 0.5)
+        pad = hw + 1.0
+        nx = -dy / seg_len
+        ny = dx / seg_len
+        px = nx * pad
+        py = ny * pad
+        inv_w = 2.0 / max(1.0, cw)
+        inv_h = 2.0 / max(1.0, ch)
+
+        ax0 = (x0 + px) * inv_w - 1.0
+        ay0 = 1.0 - (y0 + py) * inv_h
+        bx0 = (x0 - px) * inv_w - 1.0
+        by0 = 1.0 - (y0 - py) * inv_h
+        ax1 = (x1 + px) * inv_w - 1.0
+        ay1 = 1.0 - (y1 + py) * inv_h
+        bx1 = (x1 - px) * inv_w - 1.0
+        by1 = 1.0 - (y1 - py) * inv_h
+
+        r, g, b, a = rgba
+        d0 = along_offset
+        d1 = along_offset + seg_len
+        self._line_verts.extend((
+            ax0, ay0, r, g, b, a,  pad, hw, d0, dash_px,
+            bx0, by0, r, g, b, a, -pad, hw, d0, dash_px,
+            ax1, ay1, r, g, b, a,  pad, hw, d1, dash_px,
+            bx0, by0, r, g, b, a, -pad, hw, d0, dash_px,
+            bx1, by1, r, g, b, a, -pad, hw, d1, dash_px,
+            ax1, ay1, r, g, b, a,  pad, hw, d1, dash_px,
+        ))
+        return d1
+
+    def add_polyline(
+        self,
+        pts: List[Tuple[float, float]],
+        cw: float,
+        ch: float,
+        rgba: Tuple[float, float, float, float],
+        width_px: float = 2.0,
+        dash_px: float = 0.0,
+    ) -> None:
+        along = 0.0
+        for i in range(len(pts) - 1):
+            along = self.add_line(
+                pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+                cw, ch, rgba, width_px=width_px, dash_px=dash_px, along_offset=along,
+            )
+
+    def flush_lines(self) -> None:
+        if not self._line_verts:
+            return
+        import moderngl
+
+        arr = np.asarray(self._line_verts, dtype=np.float32)
+        n_bytes = arr.nbytes
+        if n_bytes > self._line_vbo_cap:
+            self._line_vbo_cap = max(n_bytes * 2, self._line_vbo_cap * 2)
+            self._line_vbo.orphan(size=self._line_vbo_cap)
+        self._line_vbo.write(arr)
+        self._line_vao.render(moderngl.TRIANGLES, vertices=len(self._line_verts) // 10)
+        self._line_verts.clear()
+
+    def draw_circle(
+        self,
+        cx: float,
+        cy: float,
+        radius_px: float,
+        cw: float,
+        ch: float,
+        fill_rgba: Tuple[float, float, float, float],
+        stroke_rgba: Tuple[float, float, float, float],
+        stroke_px: float = 1.5,
+        dashed: bool = False,
+    ) -> None:
+        import moderngl
+
+        outer = max(1.0, radius_px + stroke_px * 0.5)
+        pad = outer + 1.5
+        if cx + pad < 0.0 or cx - pad > cw or cy + pad < 0.0 or cy - pad > ch:
+            return
+        inv_w = 2.0 / max(1.0, cw)
+        inv_h = 2.0 / max(1.0, ch)
+        nx0 = (cx - pad) * inv_w - 1.0
+        nx1 = (cx + pad) * inv_w - 1.0
+        ny0 = 1.0 - (cy + pad) * inv_h
+        ny1 = 1.0 - (cy - pad) * inv_h
+        self._circle_prog["u_rect"].value = (nx0, ny0, nx1, ny1)
+        self._circle_prog["u_fill"].value = fill_rgba
+        self._circle_prog["u_stroke"].value = stroke_rgba
+        self._circle_prog["u_outer_px"].value = float(pad)
+        self._circle_prog["u_stroke_px"].value = float(stroke_px + (pad - outer))
+        self._circle_prog["u_dashed"].value = 1 if dashed else 0
+        self._circle_vao.render(moderngl.TRIANGLE_STRIP)
+
+    def _get_label_tex(
+        self,
+        text: str,
+        pt_size: int,
+        bold: bool,
+        hex_color: str,
+        shadow: bool,
+        dpr: float,
+    ) -> Tuple[Any, float, float]:
+        import moderngl
+
+        dpr_q = max(100, int(round(dpr * 100)))
+        key = (text, pt_size, bold, hex_color, shadow, dpr_q)
+        cached = self._labels.get(key)
+        if cached is not None:
+            self._labels.move_to_end(key)
+            return cached
+
+        font = QFont("Segoe UI", pt_size, QFont.Weight.Bold if bold else QFont.Weight.Normal)
+        fm = QFontMetrics(font)
+        br = fm.boundingRect(text)
+        pad_x = 4
+        pad_y = 2
+        lw = max(2, br.width() + pad_x * 2 + 2)
+        lh = max(2, fm.height() + pad_y * 2)
+        scale = dpr_q / 100.0
+        pw = max(2, int(math.ceil(lw * scale)))
+        ph = max(2, int(math.ceil(lh * scale)))
+
+        img = QImage(pw, ph, QImage.Format.Format_RGBA8888)
+        img.fill(Qt.GlobalColor.transparent)
+        img.setDevicePixelRatio(scale)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        p.setFont(font)
+        baseline_y = pad_y + fm.ascent()
+        if shadow:
+            p.setPen(QPen(QColor(10, 12, 16, 220)))
+            p.drawText(QPointF(pad_x + 1.0, baseline_y + 1.0), text)
+        p.setPen(QPen(QColor(hex_color)))
+        p.drawText(QPointF(float(pad_x), float(baseline_y)), text)
+        p.end()
+
+        raw_bits = bytes(img.constBits())
+        bpl = int(img.bytesPerLine())
+        if bpl == pw * 4:
+            tex_data = raw_bits
+        else:
+            arr_img = np.frombuffer(raw_bits, dtype=np.uint8).reshape((ph, bpl))[:, : pw * 4]
+            tex_data = np.ascontiguousarray(arr_img)
+        tex = self.ctx.texture((pw, ph), 4, data=tex_data)
+        tex.repeat_x = False
+        tex.repeat_y = False
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+        self._labels[key] = (tex, float(lw), float(lh))
+        while len(self._labels) > self._label_cap:
+            _, (old_tex, _, _) = self._labels.popitem(last=False)
+            try:
+                old_tex.release()
+            except Exception:
+                pass
+        return tex, float(lw), float(lh)
+
+    def draw_text(
+        self,
+        x_px: float,
+        y_px: float,
+        text: str,
+        cw: float,
+        ch: float,
+        dpr: float,
+        hex_color: str = "#f0f6fc",
+        pt_size: int = 8,
+        bold: bool = True,
+        shadow: bool = True,
+        align_center: bool = False,
+    ) -> None:
+        import moderngl
+
+        if not text:
+            return
+        tex, lw, lh = self._get_label_tex(text, pt_size, bold, hex_color, shadow, dpr)
+        if align_center:
+            x0 = x_px - lw * 0.5
+            y0 = y_px - lh * 0.5
+        else:
+            x0 = x_px - 4.0
+            y0 = y_px - lh * 0.72
+        x1 = x0 + lw
+        y1 = y0 + lh
+        if x1 < 0.0 or x0 > cw or y1 < 0.0 or y0 > ch:
+            return
+        inv_w = 2.0 / max(1.0, cw)
+        inv_h = 2.0 / max(1.0, ch)
+        nx0 = x0 * inv_w - 1.0
+        nx1 = x1 * inv_w - 1.0
+        ny0 = 1.0 - y1 * inv_h
+        ny1 = 1.0 - y0 * inv_h
+        tex.use(location=0)
+        self._quad_prog["u_tex"].value = 0
+        self._quad_prog["u_rect"].value = (nx0, ny0, nx1, ny1)
+        self._quad_prog["u_uv_rect"].value = (0.0, 0.0, 1.0, 1.0)
+        self._quad_vao.render(moderngl.TRIANGLE_STRIP)
 
 
 class GPUMapViewport(QOpenGLWidget):
-    """Hardware-accelerated OpenGL 2D/3D map viewport with GPU mipmaps + QPainter vector overlays."""
+    """Hardware-accelerated OpenGL 2D/3D map viewport with GPU mipmaps + GPU-native vector overlays."""
 
     def __init__(self, win: "ForeverNavigatorQtWindow"):
         super().__init__(win)
@@ -236,25 +582,23 @@ class GPUMapViewport(QOpenGLWidget):
         self._prog = None
         self._vao = None
         self._vbo = None
-        self._textures: OrderedDict[str, Tuple[Any, int, int, int]] = OrderedDict()  # key -> (tex, w, h, ver)
+        self._gpu_ov: Optional[_GPUOverlayRenderer] = None
+        self._textures: OrderedDict[str, Tuple[Any, int, int, int, int]] = OrderedDict()  # key -> (tex, w, h, ver, comp)
         self._tex_versions: Dict[str, int] = {}
-        self._pending_uploads: Dict[str, Tuple[np.ndarray, bool]] = {}  # key -> (rgb_arr, build_mips)
+        self._pending_uploads: Dict[str, Tuple[np.ndarray, bool]] = {}  # key -> (rgba_arr, build_mips)
         self._pending_evictions: List[str] = []
         self._pending_3d_scene: Optional[Tuple[str, Dict[str, Any]]] = None
-        self._overlay = _MapOverlayWidget(self)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._overlay.setGeometry(0, 0, self.width(), self.height())
-
-    def update(self, *args) -> None:  # type: ignore[override]
-        super().update(*args)
-        if hasattr(self, "_overlay") and self._overlay is not None:
-            self._overlay.update()
+        self._cached_3d_spawns: Dict[str, Tuple[np.ndarray, np.ndarray, List[Any]]] = {}
 
     def queue_texture_upload(self, key: str, arr_rgb: np.ndarray, build_mips: bool = True) -> None:
-        """Schedule an RGB uint8 numpy array to be uploaded to GPU VRAM on the next paintGL."""
-        self._pending_uploads[key] = (np.ascontiguousarray(arr_rgb, dtype=np.uint8), build_mips)
+        """Schedule an RGB/RGBA uint8 numpy array to be uploaded to GPU VRAM on the next paintGL."""
+        self._pending_uploads[key] = (_to_rgba_u8(arr_rgb), build_mips)
+        self._tex_versions[key] = self._tex_versions.get(key, 0) + 1
+        self.update()
+
+    def queue_texture_upload_rgba(self, key: str, arr_rgba: np.ndarray, build_mips: bool = True) -> None:
+        """Schedule a pre-converted contiguous RGBA uint8 array for zero-copy GPU upload."""
+        self._pending_uploads[key] = (arr_rgba, build_mips)
         self._tex_versions[key] = self._tex_versions.get(key, 0) + 1
         self.update()
 
@@ -271,7 +615,10 @@ class GPUMapViewport(QOpenGLWidget):
         try:
             self.makeCurrent()
             self.win.viewer_3d.release_gl_only()
-            for tex, _, _, _ in self._textures.values():
+            if self._gpu_ov is not None:
+                self._gpu_ov.release()
+                self._gpu_ov = None
+            for tex, _, _, _, _ in self._textures.values():
                 try:
                     tex.release()
                 except Exception:
@@ -304,8 +651,9 @@ class GPUMapViewport(QOpenGLWidget):
             ],
             dtype=np.float32,
         )
-        self._vbo = self._mgl.buffer(verts.tobytes())
+        self._vbo = self._mgl.buffer(verts)
         self._vao = self._mgl.vertex_array(self._prog, [(self._vbo, "2f 2f", "in_pos", "in_uv")])
+        self._gpu_ov = _GPUOverlayRenderer(self._mgl, self._prog, self._vao, self._vbo)
 
     def _flush_texture_ops(self) -> None:
         import moderngl
@@ -324,17 +672,18 @@ class GPUMapViewport(QOpenGLWidget):
         for key, (arr, build_mips) in list(self._pending_uploads.items()):
             self._pending_uploads.pop(key, None)
             h, w = arr.shape[:2]
+            comp = 4 if (arr.ndim == 3 and arr.shape[2] == 4) else 3
             old = self._textures.pop(key, None)
-            if old is not None and old[1] == w and old[2] == h:
+            if old is not None and old[1] == w and old[2] == h and old[4] == comp:
                 tex = old[0]
-                tex.write(arr.tobytes())
+                tex.write(arr)
             else:
                 if old is not None:
                     try:
                         old[0].release()
                     except Exception:
                         pass
-                tex = self._mgl.texture((w, h), 3, data=arr.tobytes())
+                tex = self._mgl.texture((w, h), comp, data=arr)
                 tex.repeat_x = False
                 tex.repeat_y = False
             if build_mips:
@@ -346,11 +695,11 @@ class GPUMapViewport(QOpenGLWidget):
                     pass
             else:
                 tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            self._textures[key] = (tex, w, h, self._tex_versions.get(key, 1))
+            self._textures[key] = (tex, w, h, self._tex_versions.get(key, 1), comp)
             self._textures.move_to_end(key)
 
-        # Enforce GPU texture budget (SSD=3, HDD=5 non-pinned textures)
-        limit = 5 if self.win._effective_storage_mode == "hdd" else 3
+        # Enforce GPU texture budget (SSD=6, HDD=10 non-pinned textures to avoid continent/zone thrashing)
+        limit = 10 if self.win._effective_storage_mode == "hdd" else 6
         pinned = {"__azeroth_ov", "__deep_tile", "__view_3d"}
         evictable = [k for k in self._textures.keys() if k not in pinned]
         while len(evictable) > limit:
@@ -412,21 +761,25 @@ class GPUMapViewport(QOpenGLWidget):
                 fbo.clear(13 / 255.0, 17 / 255.0, 23 / 255.0, 1.0)
                 self._paint_zone_gl(cw, ch)
 
-    def _paint_overlays(self, painter: QPainter, cw: float, ch: float) -> None:
-        # Vector overlays drawn crisply on top via _MapOverlayWidget
+            # GPU-native vector & text overlays (zero QPainter on GL context, zero CPU backing-store upload)
+            if self._gpu_ov is not None:
+                self._mgl.disable(self._mgl.DEPTH_TEST | self._mgl.CULL_FACE)
+                self._mgl.enable(self._mgl.BLEND)
+                self._mgl.blend_func = (self._mgl.SRC_ALPHA, self._mgl.ONE_MINUS_SRC_ALPHA)
+                self._paint_overlays_gpu(self._gpu_ov, cw, ch, dpr)
+
+    def _paint_overlays_gpu(self, ov: _GPUOverlayRenderer, cw: float, ch: float, dpr: float) -> None:
         if self.win._showing_azeroth_overview and not self.win.view_3d_mode and not self.win.replay_mode:
             if "__azeroth_ov" not in self._textures:
-                painter.setPen(QColor("#8b949e"))
-                painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-                painter.drawText(
-                    QRectF(0, 0, cw, ch),
-                    Qt.AlignmentFlag.AlignCenter,
+                ov.draw_text(
+                    cw * 0.5, ch * 0.5,
                     "Loading Azeroth Overview (Kalimdor & Eastern Kingdoms)...",
+                    cw, ch, dpr, hex_color="#8b949e", pt_size=11, bold=True, shadow=False, align_center=True,
                 )
         elif self.win.view_3d_mode:
-            self._paint_3d_overlays(painter, cw, ch)
+            self._paint_3d_overlays_gpu(ov, cw, ch, dpr)
         else:
-            self._paint_zone_overlays(painter, cw, ch)
+            self._paint_zone_overlays_gpu(ov, cw, ch, dpr)
 
     def _paint_overview_gl(self, cw: float, ch: float) -> None:
         ov = self.win._azeroth_overview
@@ -446,7 +799,7 @@ class GPUMapViewport(QOpenGLWidget):
                 if not self.win._is_interacting and sc_cont >= 1.65:
                     tile_key = (cont_slug, int(round(cx_cont)), int(round(cy_cont)), round(sc_cont, 3), int(cw), int(ch))
                     if self.win._deep_tile_key == tile_key and "__deep_tile" in self._textures:
-                        tex, _, _, _ = self._textures["__deep_tile"]
+                        tex = self._textures["__deep_tile"][0]
                         self._draw_textured_quad(tex, 0.0, 0.0, cw, ch, cw, ch)
                         drew_hi = True
                     else:
@@ -457,7 +810,7 @@ class GPUMapViewport(QOpenGLWidget):
                     l1_key = f"__l1_{cont_slug}"
                     self.win._ensure_continent_l1_async(cont_slug)
                     if l1_key in self._textures and cont_slug in self.win._cont_l1_native:
-                        tex, tw, th, _ = self._textures[l1_key]
+                        tex = self._textures[l1_key][0]
                         native_px = float(self.win._cont_l1_native[cont_slug])
                         x0 = (0.0 - cx_cont) * sc_cont + cw * 0.5
                         y0 = (0.0 - cy_cont) * sc_cont + ch * 0.5
@@ -468,7 +821,7 @@ class GPUMapViewport(QOpenGLWidget):
 
         # Level 0: 4K Azeroth world GPU texture
         if not drew_hi and "__azeroth_ov" in self._textures:
-            tex, tw, th, _ = self._textures["__azeroth_ov"]
+            tex = self._textures["__azeroth_ov"][0]
             x0 = (0.0 - self.win._overview_pan_x) * sc_ov + cw * 0.5
             y0 = (0.0 - self.win._overview_pan_y) * sc_ov + ch * 0.5
             x1 = (float(ov.width) - self.win._overview_pan_x) * sc_ov + cw * 0.5
@@ -501,21 +854,20 @@ class GPUMapViewport(QOpenGLWidget):
             follow_player=self.win.chk_follow.isChecked(),
         )
 
-    def _paint_3d_overlays(self, p: QPainter, cw: float, ch: float) -> None:
+    def _paint_3d_overlays_gpu(self, ov: _GPUOverlayRenderer, cw: float, ch: float, dpr: float) -> None:
         slug = self.win._active_slug()
         d = self.win.tracker_3d.dungeons.get(slug)
         v3d = self.win.viewer_3d
         err = getattr(self.win, "_scene_3d_error", None)
         if err:
-            p.setPen(QColor("#e6c373"))
-            p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-            p.drawText(QRectF(24, 0, cw - 48, ch), Qt.AlignmentFlag.AlignCenter, err)
+            ov.draw_text(cw * 0.5, ch * 0.5, err, cw, ch, dpr, hex_color="#e6c373", pt_size=11, bold=True, align_center=True)
             return
         if d is None or v3d._loaded_slug != slug or v3d._scene is None or v3d._last_mvp is None:
             name = d.name if d is not None else slug
-            p.setPen(QColor("#8b949e"))
-            p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-            p.drawText(QRectF(0, 0, cw, ch), Qt.AlignmentFlag.AlignCenter, f"Loading 3D WMO Model ({name})...")
+            ov.draw_text(
+                cw * 0.5, ch * 0.5, f"Loading 3D WMO Model ({name})...",
+                cw, ch, dpr, hex_color="#8b949e", pt_size=11, bold=True, align_center=True,
+            )
             return
 
         mvp_mat = v3d._last_mvp
@@ -529,36 +881,45 @@ class GPUMapViewport(QOpenGLWidget):
             ndc_y = np.where(valid, clip[:, 1] / np.maximum(0.5, w_c), -99.0)
             return (ndc_x * 0.5 + 0.5) * cw, (0.5 - ndc_y * 0.5) * ch, valid
 
-        # Spawns
+        ov.begin_lines()
+        circles_to_draw: List[Tuple[float, float, float, Tuple[float, float, float, float], Tuple[float, float, float, float], float]] = []
+        labels_to_draw: List[Tuple[float, float, str, str]] = []
+
+        # Cached 3D spawn positions (avoids per-frame nearest-waypoint search!)
         if self.win.chk_spawns.isChecked():
-            spawns = get_spawns_for_dungeon(slug)
+            cached_sp = self._cached_3d_spawns.get(slug)
+            if cached_sp is None:
+                spawns = get_spawns_for_dungeon(slug)
+                if spawns:
+                    map_h = d.map_size_px
+                    sp_pts = []
+                    for sp in spawns:
+                        wx, wy = d.map_px_to_world(sp.u * map_h, sp.v * map_h)
+                        wz = v3d.snap_world_z(d, np.array([wx, wy], dtype=np.float32))
+                        sp_pts.append([wx, wy, wz])
+                    sp_arr = np.array(sp_pts, dtype=np.float32)
+                    sp_top = sp_arr.copy()
+                    sp_top[:, 2] += 14.0
+                    cached_sp = (sp_arr, sp_top, spawns)
+                else:
+                    cached_sp = (np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32), [])
+                self._cached_3d_spawns[slug] = cached_sp
+
+            sp_arr, sp_top, spawns = cached_sp
             if spawns:
-                map_h = d.map_size_px
-                sp_pts = []
-                for sp in spawns:
-                    wx, wy = d.map_px_to_world(sp.u * map_h, sp.v * map_h)
-                    wz = v3d.snap_world_z(d, np.array([wx, wy], dtype=np.float32))
-                    sp_pts.append([wx, wy, wz])
-                sp_arr = np.array(sp_pts, dtype=np.float32)
-                sp_top = sp_arr.copy()
-                sp_top[:, 2] += 14.0
                 bu, bv, bok = project(sp_arr)
                 pu, pv, pok = project(sp_top)
-                p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
                 for i, sp in enumerate(spawns):
                     if not (bok[i] and pok[i]):
                         continue
                     bx, by, px, py = float(bu[i]), float(bv[i]), float(pu[i]), float(pv[i])
-                    if not (-40 <= px <= cw + 40 and -40 <= py <= ch + 40):
+                    if not (-40.0 <= px <= cw + 40.0 and -40.0 <= py <= ch + 40.0):
                         continue
-                    col = QColor("#5adcfc") if sp.kind == "entrance" else QColor("#ffa53c")
-                    p.setPen(QPen(col, 2.0))
-                    p.drawLine(QPointF(bx, by), QPointF(px, py))
-                    p.setBrush(QBrush(col))
-                    p.setPen(QPen(QColor("#ffffff"), 1.2))
-                    p.drawEllipse(QPointF(px, py), 5.0, 5.0)
-                    p.setPen(QPen(col))
-                    p.drawText(QPointF(px + 8, py + 4), sp.label)
+                    hex_c = "#5adcfc" if sp.kind == "entrance" else "#ffa53c"
+                    rgba_c = _hex_to_rgba_f(hex_c)
+                    ov.add_line(bx, by, px, py, cw, ch, rgba_c, width_px=2.0)
+                    circles_to_draw.append((px, py, 5.0, rgba_c, (1.0, 1.0, 1.0, 1.0), 1.2))
+                    labels_to_draw.append((px + 8.0, py + 4.0, sp.label, hex_c))
 
         # Local player 3D beacon
         if v3d._last_p3d is not None:
@@ -567,17 +928,19 @@ class GPUMapViewport(QOpenGLWidget):
             tu, tv, tok = project((p3d + np.array([0.0, 0.0, 18.0], dtype=np.float32))[None, :])
             if bok[0] and tok[0]:
                 bx, by, tx, ty = float(bu[0]), float(bv[0]), float(tu[0]), float(tv[0])
-                p.setPen(QPen(QColor("#ff644b"), 3.0))
-                p.drawLine(QPointF(bx, by), QPointF(tx, ty))
-                p.setBrush(QBrush(QColor("#ff5041")))
-                p.setPen(QPen(QColor("#ffffff"), 2.0))
-                p.drawEllipse(QPointF(tx, ty), 7.0, 7.0)
+                ov.add_line(bx, by, tx, ty, cw, ch, _hex_to_rgba_f("#ff644b"), width_px=3.0)
+                circles_to_draw.append((tx, ty, 7.0, _hex_to_rgba_f("#ff5041"), (1.0, 1.0, 1.0, 1.0), 2.0))
 
-        p.setPen(QColor("#c8d2e1"))
-        p.setFont(QFont("Segoe UI", 8))
-        p.drawText(
-            QPointF(10, ch - 10),
+        ov.flush_lines()
+        for cx, cy, rad, fill_c, stroke_c, sw in circles_to_draw:
+            ov.draw_circle(cx, cy, rad, cw, ch, fill_c, stroke_c, stroke_px=sw)
+        for lx, ly, txt, hex_c in labels_to_draw:
+            ov.draw_text(lx, ly, txt, cw, ch, dpr, hex_color=hex_c, pt_size=8, bold=True)
+
+        ov.draw_text(
+            10.0, ch - 8.0,
             f"GPU 3D Model (WMO) | Left-drag: Orbit | Right-drag: Pan | Scroll: Zoom ({int(v3d.zoom * 100)}%)",
+            cw, ch, dpr, hex_color="#c8d2e1", pt_size=8, bold=False,
         )
 
     def _paint_zone_gl(self, cw: float, ch: float) -> None:
@@ -604,7 +967,7 @@ class GPUMapViewport(QOpenGLWidget):
                     l1_key = f"__l1_{cont_slug}"
                     cont_meta = self.win._cont_meta.get(cont_slug)
                     if l1_key in self._textures and cont_meta is not None:
-                        tex, _, _, _ = self._textures[l1_key]
+                        tex = self._textures[l1_key][0]
                         wx_c, wy_c = d.map_px_to_world(self.win.pan_x, self.win.pan_y)
                         ch_cont = float(cont_meta["map_size_px"])
                         c_scale = float(cont_meta["map_scale"])
@@ -622,121 +985,118 @@ class GPUMapViewport(QOpenGLWidget):
         self.win._ensure_zone_texture(slug, d)
         z_key = f"zone_{slug}"
         if z_key in self._textures:
-            tex, _, _, _ = self._textures[z_key]
+            tex = self._textures[z_key][0]
             self._draw_textured_quad(tex, dx0, dy0, dx1, dy1, cw, ch)
 
-    def _paint_zone_overlays(self, p: QPainter, cw: float, ch: float) -> None:
+    def _paint_zone_overlays_gpu(self, ov: _GPUOverlayRenderer, cw: float, ch: float, dpr: float) -> None:
         slug = self.win._active_slug()
         d = self.win.tracker_3d.dungeons.get(slug)
         if d is None:
             return
         map_h = float(d.map_size_px)
         sc = self.win._eff_scale(int(cw), int(ch), int(map_h))
+        pan_x = self.win.pan_x
+        pan_y = self.win.pan_y
+        half_cw = cw * 0.5
+        half_ch = ch * 0.5
 
-        def m2c(mx: float, my: float) -> Tuple[float, float]:
-            return (mx - self.win.pan_x) * sc + cw * 0.5, (my - self.win.pan_y) * sc + ch * 0.5
-
-        # Spawns
-        if self.win.chk_spawns.isChecked():
-            p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            for sp in get_spawns_for_dungeon(slug):
-                sx, sy = m2c(sp.u * map_h, sp.v * map_h)
-                if not (-40 <= sx <= cw + 40 and -40 <= sy <= ch + 40):
-                    continue
-                col = QColor("#5adcfc") if sp.kind == "entrance" else QColor("#ffa53c")
-                p.setBrush(QBrush(col))
-                p.setPen(QPen(QColor("#14161c"), 1.5))
-                p.drawEllipse(QPointF(sx, sy), 5.0, 5.0)
-                p.setPen(QPen(col))
-                p.drawText(QPointF(sx + 8, sy + 4), sp.label)
+        ov.begin_lines()
+        labels: List[Tuple[float, float, str, str, int]] = []
+        range_circles: List[Tuple[float, float, float, Tuple[float, float, float, float]]] = []
 
         # Collaborative Whiteboard ops
         for op in self.win.whiteboard.ops_for(slug):
-            col = QColor(op.color)
+            rgba_c = _hex_to_rgba_f(op.color)
             if op.kind == "stroke" and len(op.points) >= 2:
-                path = QPainterPath()
-                x0, y0 = m2c(op.points[0][0] * map_h, op.points[0][1] * map_h)
-                path.moveTo(x0, y0)
-                for u, v in op.points[1:]:
-                    x1, y1 = m2c(u * map_h, v * map_h)
-                    path.lineTo(x1, y1)
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(col, max(1, op.width), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                p.drawPath(path)
+                pts = [((u * map_h - pan_x) * sc + half_cw, (v * map_h - pan_y) * sc + half_ch) for u, v in op.points]
+                ov.add_polyline(pts, cw, ch, rgba_c, width_px=float(max(1, op.width)))
             elif op.kind == "text" and op.points:
-                sx, sy = m2c(op.points[0][0] * map_h, op.points[0][1] * map_h)
-                p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-                p.setPen(QPen(col))
-                p.drawText(QPointF(sx, sy), op.text)
+                sx = (op.points[0][0] * map_h - pan_x) * sc + half_cw
+                sy = (op.points[0][1] * map_h - pan_y) * sc + half_ch
+                labels.append((sx, sy, op.text, op.color, 10))
             elif op.kind == "circle_range" and op.points:
-                sx, sy = m2c(op.points[0][0] * map_h, op.points[0][1] * map_h)
+                sx = (op.points[0][0] * map_h - pan_x) * sc + half_cw
+                sy = (op.points[0][1] * map_h - pan_y) * sc + half_ch
                 r_px = yards_to_map_px(op.radius_yd, d.map_scale) * sc
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(col, 2.0, Qt.PenStyle.DashLine))
-                p.drawEllipse(QPointF(sx, sy), r_px, r_px)
-                p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                p.drawText(QPointF(sx - 18, sy - r_px - 6), f"{op.radius_yd:.0f} yd")
+                range_circles.append((sx, sy, r_px, rgba_c))
+                labels.append((sx - 18.0, sy - r_px - 6.0, f"{op.radius_yd:.0f} yd", op.color, 8))
 
         # Active in-progress stroke
         if len(self.win._active_stroke_pts) >= 2:
-            path = QPainterPath()
-            x0, y0 = m2c(self.win._active_stroke_pts[0][0] * map_h, self.win._active_stroke_pts[0][1] * map_h)
-            path.moveTo(x0, y0)
-            for u, v in self.win._active_stroke_pts[1:]:
-                x1, y1 = m2c(u * map_h, v * map_h)
-                path.lineTo(x1, y1)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor("#ffe066"), 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawPath(path)
+            pts = [((u * map_h - pan_x) * sc + half_cw, (v * map_h - pan_y) * sc + half_ch) for u, v in self.win._active_stroke_pts]
+            ov.add_polyline(pts, cw, ch, _hex_to_rgba_f("#ffe066"), width_px=3.0)
 
         # Active Yard Ruler
         if self.win.active_ruler is not None:
             r = self.win.active_ruler
-            x0, y0 = m2c(r.start_uv[0] * map_h, r.start_uv[1] * map_h)
-            x1, y1 = m2c(r.end_uv[0] * map_h, r.end_uv[1] * map_h)
-            p.setPen(QPen(QColor("#63b3ed"), 2.0, Qt.PenStyle.DashLine))
-            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
-            p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-            p.setPen(QPen(QColor("#90cdf4")))
-            p.drawText(QPointF((x0 + x1) * 0.5, (y0 + y1) * 0.5 - 10), f"{r.yards:.1f} yd")
+            x0 = (r.start_uv[0] * map_h - pan_x) * sc + half_cw
+            y0 = (r.start_uv[1] * map_h - pan_y) * sc + half_ch
+            x1 = (r.end_uv[0] * map_h - pan_x) * sc + half_cw
+            y1 = (r.end_uv[1] * map_h - pan_y) * sc + half_ch
+            ov.add_line(x0, y0, x1, y1, cw, ch, _hex_to_rgba_f("#63b3ed"), width_px=2.0, dash_px=12.0)
+            labels.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5 - 10.0, f"{r.yards:.1f} yd", "#90cdf4", 10))
+
+        # Dead-player X lines queued into same single line batch
+        shown = self.win.replay_players if self.win.replay_mode else self.win.raid_players
+        dead_rgba = _hex_to_rgba_f("#e53e3e")
+        for pl in shown.values():
+            if pl.dungeon_slug != slug or bool(getattr(pl, "alive", True)):
+                continue
+            sx = (pl.map_px[0] - pan_x) * sc + half_cw
+            sy = (pl.map_px[1] - pan_y) * sc + half_ch
+            ov.add_line(sx - 5.0, sy - 5.0, sx + 5.0, sy + 5.0, cw, ch, dead_rgba, width_px=2.0)
+            ov.add_line(sx - 5.0, sy + 5.0, sx + 5.0, sy - 5.0, cw, ch, dead_rgba, width_px=2.0)
+
+        ov.flush_lines()
+
+        # Dashed range circles
+        transparent = (0.0, 0.0, 0.0, 0.0)
+        for sx, sy, r_px, rgba_c in range_circles:
+            ov.draw_circle(sx, sy, r_px, cw, ch, transparent, rgba_c, stroke_px=2.0, dashed=True)
+
+        # Spawns
+        if self.win.chk_spawns.isChecked():
+            dark_outline = _hex_to_rgba_f("#14161c")
+            for sp in get_spawns_for_dungeon(slug):
+                sx = (sp.u * map_h - pan_x) * sc + half_cw
+                sy = (sp.v * map_h - pan_y) * sc + half_ch
+                if not (-40.0 <= sx <= cw + 40.0 and -40.0 <= sy <= ch + 40.0):
+                    continue
+                hex_c = "#5adcfc" if sp.kind == "entrance" else "#ffa53c"
+                ov.draw_circle(sx, sy, 5.0, cw, ch, _hex_to_rgba_f(hex_c), dark_outline, stroke_px=1.5)
+                labels.append((sx + 8.0, sy + 4.0, sp.label, hex_c, 8))
 
         # Connected Raid Players / Replay Players
-        shown = self.win.replay_players if self.win.replay_mode else self.win.raid_players
-        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         for pl in shown.values():
             if pl.dungeon_slug != slug:
                 continue
-            sx, sy = m2c(pl.map_px[0], pl.map_px[1])
+            sx = (pl.map_px[0] - pan_x) * sc + half_cw
+            sy = (pl.map_px[1] - pan_y) * sc + half_ch
             alive = bool(getattr(pl, "alive", True))
-            col = QColor(WOW_CLASS_COLORS.get(pl.wow_class, "#ff5a46") if alive else "#878c96")
+            hex_c = WOW_CLASS_COLORS.get(pl.wow_class, "#ff5a46") if alive else "#878c96"
             is_local = (pl.player_id == self.win.identity.player_id) and not self.win.replay_mode
-            outline = QColor("#f5c96b" if is_local else "#ffffff")
+            outline = _hex_to_rgba_f("#f5c96b" if is_local else "#ffffff")
             rad = 7.0 if is_local else 6.0
-            p.setBrush(QBrush(col))
-            p.setPen(QPen(outline, 2.0))
-            p.drawEllipse(QPointF(sx, sy), rad, rad)
-            if not alive:
-                p.setPen(QPen(QColor("#e53e3e"), 2.0))
-                p.drawLine(QPointF(sx - 5, sy - 5), QPointF(sx + 5, sy + 5))
-                p.drawLine(QPointF(sx - 5, sy + 5), QPointF(sx + 5, sy - 5))
+            ov.draw_circle(sx, sy, rad, cw, ch, _hex_to_rgba_f(hex_c), outline, stroke_px=2.0)
             badge = _role_badge(pl.role)
             label = f"[{badge}|DEAD] {pl.name}" if not alive else f"[{badge}] {pl.name}"
-            p.setPen(QPen(QColor("#0a0c10")))
-            p.drawText(QPointF(sx + 10, sy + 4), label)
-            p.setPen(QPen(QColor("#fc8181") if not alive else col))
-            p.drawText(QPointF(sx + 9, sy + 3), label)
+            labels.append((sx + 9.0, sy + 3.0, label, "#fc8181" if not alive else hex_c, 8))
 
         # Local player marker (clean dot using sub-pixel smoothed coordinates)
         est = self.win._latest_est
         if est is not None and not self.win.replay_mode and self.win.identity.player_id not in shown:
             rpx = getattr(self.win, "_render_px", None)
             if rpx is not None:
-                sx, sy = m2c(rpx[0], rpx[1])
+                sx = (rpx[0] - pan_x) * sc + half_cw
+                sy = (rpx[1] - pan_y) * sc + half_ch
             else:
-                sx, sy = m2c(est.map_px[0], est.map_px[1])
-            p.setBrush(QBrush(QColor("#ff5a46")))
-            p.setPen(QPen(QColor("#ffffff"), 2.0))
-            p.drawEllipse(QPointF(sx, sy), 7.0, 7.0)
+                sx = (est.map_px[0] - pan_x) * sc + half_cw
+                sy = (est.map_px[1] - pan_y) * sc + half_ch
+            ov.draw_circle(sx, sy, 7.0, cw, ch, _hex_to_rgba_f("#ff5a46"), (1.0, 1.0, 1.0, 1.0), stroke_px=2.0)
+
+        # Crisp cached text labels
+        for lx, ly, txt, hex_c, pt in labels:
+            ov.draw_text(lx, ly, txt, cw, ch, dpr, hex_color=hex_c, pt_size=pt, bold=True)
 
     # --- Mouse & Wheel Forwarding ---
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -1115,6 +1475,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
         self._zoom_target: Optional[float] = None
         self._zoom_anchor: Optional[Tuple[float, float]] = None
+        self._zoom_last_t: float = 0.0
+        self._last_zoom_lbl: str = "100%"
         self._transition_state: Optional[Dict[str, Any]] = None
         self._all_map_entries: List[Any] = []
         self._filtered_map_entries: List[Any] = []
@@ -1612,8 +1974,9 @@ class ForeverNavigatorQtWindow(QMainWindow):
                 from ..navigator.world_maps import build_azeroth_overview
 
                 ov = build_azeroth_overview(self.world_maps, width=3840, height=2160, use_disk_cache=True)
+                rgba = _to_rgba_u8(np.asarray(ov.image, dtype=np.uint8)) if ov is not None else None
                 if not self._closing:
-                    self._ui_queue.put(("azeroth_overview_loaded", ov))
+                    self._ui_queue.put(("azeroth_overview_loaded", (ov, rgba)))
             except Exception:
                 pass
 
@@ -1629,7 +1992,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
             res = None
             meta = None
             try:
-                res = self.world_maps.load_continent_l1_array(slug, max_px=4096)
+                raw_res = self.world_maps.load_continent_l1_array(slug, max_px=4096)
+                if raw_res is not None:
+                    arr_rgb, native_px = raw_res
+                    res = (_to_rgba_u8(arr_rgb), native_px)
                 d = self.world_maps.load_map(slug, preview_only=True, max_preview_px=512)
                 meta = {
                     "map_size_px": int(d.map_size_px),
@@ -1647,21 +2013,26 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self, cont_slug: str, cx_cont: float, cy_cont: float, sc_cont: float, cw: int, ch: int
     ) -> None:
         key = (cont_slug, int(round(cx_cont)), int(round(cy_cont)), round(sc_cont, 3), cw, ch)
-        if self._deep_tile_key == key:
+        if self._deep_tile_key == key or getattr(self, "_deep_tile_inflight_key", None) == key:
             return
         self._deep_tile_req_id += 1
         req_id = self._deep_tile_req_id
+        self._deep_tile_inflight_key = key
 
         def _worker() -> None:
             arr = None
             try:
+                if req_id != self._deep_tile_req_id or self._closing:
+                    return
                 if self.world_maps is not None and self.world_maps.ensure_full_res_tiles(cont_slug):
+                    if req_id != self._deep_tile_req_id or self._closing:
+                        return
                     vp = self.world_maps.render_full_res_viewport(cont_slug, cx_cont, cy_cont, sc_cont, cw, ch)
-                    if vp is not None:
-                        arr = np.asarray(vp, dtype=np.uint8).copy()
+                    if vp is not None and req_id == self._deep_tile_req_id:
+                        arr = _to_rgba_u8(np.asarray(vp, dtype=np.uint8))
             except Exception:
                 arr = None
-            if not self._closing:
+            if not self._closing and req_id == self._deep_tile_req_id:
                 self._ui_queue.put(("deep_tile_ready", (req_id, key, arr)))
 
         threading.Thread(target=_worker, daemon=True, name=f"QtDeepTile-{req_id}").start()
@@ -1680,22 +2051,31 @@ class ForeverNavigatorQtWindow(QMainWindow):
             self._streaming_zones.add(slug)
 
             def _worker(p: Path = Path(full_path), s: str = slug) -> None:
-                arr = None
+                arr_rgba = None
                 try:
+                    arr_rgb = None
                     if p.suffix.lower() == ".png" and p.exists():
                         with Image.open(p) as raw:
-                            arr = np.asarray(raw.convert("RGB"), dtype=np.uint8).copy()
+                            arr_rgb = np.asarray(raw.convert("RGB"), dtype=np.uint8).copy()
                     elif p.exists():
                         with np.load(p, allow_pickle=False) as z:
-                            arr = z["map_image"].astype(np.uint8)
-                    if arr is not None and arr.shape[0] > 512:
-                        self.tracker_mm.upgrade_zone_resolution(s, arr, max_work_px=1024)
+                            arr_rgb = z["map_image"].astype(np.uint8)
+                    if arr_rgb is not None:
+                        if arr_rgb.shape[0] > 512:
+                            self.tracker_mm.upgrade_zone_resolution(s, arr_rgb, max_work_px=1024)
+                        arr_rgba = _to_rgba_u8(arr_rgb)
                 except Exception:
-                    arr = None
+                    arr_rgba = None
                 if not self._closing:
-                    self._ui_queue.put(("zone_fullres_loaded", (s, arr)))
+                    self._ui_queue.put(("zone_fullres_loaded", (s, arr_rgba)))
 
             threading.Thread(target=_worker, daemon=True, name=f"QtStreamZone-{slug}").start()
+
+    def _set_zoom_label(self, zoom_val: float) -> None:
+        txt = f"{int(round(zoom_val * 100))}%"
+        if txt != self._last_zoom_lbl:
+            self._last_zoom_lbl = txt
+            self.lbl_zoom.setText(txt)
 
     # --- Smooth Zoom & Pan Interactions ---
     def _on_mousewheel(self, event: QWheelEvent) -> None:
@@ -1707,47 +2087,54 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self._deep_tile_key = None
         if self.view_3d_mode:
             base = self._zoom_target if self._zoom_target is not None else self.viewer_3d.zoom
-            self._zoom_target = float(np.clip(base * factor, 0.4, 6.0))
+            self._zoom_target = max(0.4, min(6.0, base * factor))
         elif self._showing_azeroth_overview:
             base = self._zoom_target if self._zoom_target is not None else self._overview_zoom
-            self._zoom_target = float(np.clip(base * factor, 0.5, 64.0))
+            self._zoom_target = max(0.5, min(64.0, base * factor))
         else:
             base = self._zoom_target if self._zoom_target is not None else self.zoom
-            self._zoom_target = float(np.clip(base * factor, 0.10, 8.0))
+            self._zoom_target = max(0.10, min(8.0, base * factor))
         pos = event.position()
         self._zoom_anchor = (float(pos.x()), float(pos.y()))
         self._is_interacting = True
         self._settle_timer.stop()
         if not self._zoom_timer.isActive():
+            self._zoom_last_t = time.perf_counter()
             self._zoom_timer.start()
 
     def _step_smooth_zoom(self) -> None:
         if self._zoom_target is None or self._closing:
             self._zoom_timer.stop()
             return
+        now_t = time.perf_counter()
+        dt = max(0.001, min(0.05, now_t - self._zoom_last_t)) if self._zoom_last_t > 0.0 else 0.008
+        self._zoom_last_t = now_t
+        # Frame-rate-independent crisp exponential ease (~110ms settle at any refresh rate)
+        ease = 1.0 - math.exp(-dt * 24.0)
+
         cw, ch = max(1, self.viewport.width()), max(1, self.viewport.height())
         ax, ay = self._zoom_anchor if self._zoom_anchor is not None else (cw * 0.5, ch * 0.5)
         target = self._zoom_target
 
         if self.view_3d_mode:
             cur = self.viewer_3d.zoom
-            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.004 else cur * ((target / cur) ** 0.28)
+            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.004 else cur * ((target / cur) ** ease)
             self.viewer_3d.zoom = nxt
-            self.lbl_zoom.setText(f"{int(round(nxt * 100))}%")
+            self._set_zoom_label(nxt)
             self._render_3d_frame()
             done = (nxt == target)
         elif self._showing_azeroth_overview:
             cur = self._overview_zoom
             old_sc = self._overview_eff_scale(cw, ch)
-            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.003 else cur * ((target / cur) ** 0.28)
+            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.003 else cur * ((target / cur) ** ease)
             self._overview_zoom = nxt
             new_sc = self._overview_eff_scale(cw, ch)
             if self._azeroth_overview is not None and old_sc > 1e-6 and new_sc > 1e-6:
                 wx_a = self._overview_pan_x + (ax - cw * 0.5) / old_sc
                 wy_a = self._overview_pan_y + (ay - ch * 0.5) / old_sc
-                self._overview_pan_x = float(np.clip(wx_a - (ax - cw * 0.5) / new_sc, 0, self._azeroth_overview.width))
-                self._overview_pan_y = float(np.clip(wy_a - (ay - ch * 0.5) / new_sc, 0, self._azeroth_overview.height))
-            self.lbl_zoom.setText(f"{int(round(nxt * 100))}%")
+                self._overview_pan_x = max(0.0, min(float(self._azeroth_overview.width), wx_a - (ax - cw * 0.5) / new_sc))
+                self._overview_pan_y = max(0.0, min(float(self._azeroth_overview.height), wy_a - (ay - ch * 0.5) / new_sc))
+            self._set_zoom_label(nxt)
             self.viewport.update()
             done = (nxt == target)
         else:
@@ -1755,15 +2142,15 @@ class ForeverNavigatorQtWindow(QMainWindow):
             map_h = d.map_size_px
             cur = self.zoom
             old_sc = self._eff_scale(cw, ch, map_h)
-            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.003 else cur * ((target / cur) ** 0.28)
+            nxt = target if abs(target / max(1e-5, cur) - 1.0) < 0.003 else cur * ((target / cur) ** ease)
             self.zoom = nxt
             new_sc = self._eff_scale(cw, ch, map_h)
             if not self.chk_follow.isChecked() and old_sc > 1e-6 and new_sc > 1e-6:
                 mx_a = self.pan_x + (ax - cw * 0.5) / old_sc
                 my_a = self.pan_y + (ay - ch * 0.5) / old_sc
-                self.pan_x = float(np.clip(mx_a - (ax - cw * 0.5) / new_sc, 0, map_h))
-                self.pan_y = float(np.clip(my_a - (ay - ch * 0.5) / new_sc, 0, map_h))
-            self.lbl_zoom.setText(f"{int(round(nxt * 100))}%")
+                self.pan_x = max(0.0, min(float(map_h), mx_a - (ax - cw * 0.5) / new_sc))
+                self.pan_y = max(0.0, min(float(map_h), my_a - (ay - ch * 0.5) / new_sc))
+            self._set_zoom_label(nxt)
             self.viewport.update()
             done = (nxt == target)
 
@@ -1847,8 +2234,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
             if self._azeroth_overview is not None:
                 cw, ch = max(1, self.viewport.width()), max(1, self.viewport.height())
                 sc_ov = self._overview_eff_scale(cw, ch)
-                self._overview_pan_x = float(np.clip(self._overview_pan_x - dx / sc_ov, 0, self._azeroth_overview.width))
-                self._overview_pan_y = float(np.clip(self._overview_pan_y - dy / sc_ov, 0, self._azeroth_overview.height))
+                self._overview_pan_x = max(0.0, min(float(self._azeroth_overview.width), self._overview_pan_x - dx / sc_ov))
+                self._overview_pan_y = max(0.0, min(float(self._azeroth_overview.height), self._overview_pan_y - dy / sc_ov))
                 self._is_interacting = True
                 self._settle_timer.start(100)
                 self.viewport.update()
@@ -1861,8 +2248,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
                 self.chk_follow.setChecked(False)
             cw, ch = max(1, self.viewport.width()), max(1, self.viewport.height())
             sc = self._eff_scale(cw, ch, map_h)
-            self.pan_x = float(np.clip(self.pan_x - dx / sc, 0, map_h))
-            self.pan_y = float(np.clip(self.pan_y - dy / sc, 0, map_h))
+            self.pan_x = max(0.0, min(float(map_h), self.pan_x - dx / sc))
+            self.pan_y = max(0.0, min(float(map_h), self.pan_y - dy / sc))
             self.viewport.update()
         elif self._tool_name == "Ruler (yd)" and self.active_ruler is not None:
             uv = self._canvas_to_uv(pos.x(), pos.y())
@@ -2397,11 +2784,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
                     self.dev_logger.log_event("capture_error", {"error": str(exc)})
                 target_end = t0 + interval
                 rem = target_end - time.perf_counter()
-                if rem > 0.002:
-                    self._stop_capture_event.wait(timeout=rem - (0.0015 if self.fps >= 20.0 else 0.0))
-                if self.fps >= 20.0 and self.running:
-                    while time.perf_counter() < target_end and not self._stop_capture_event.is_set():
-                        time.sleep(0)
+                if rem > 0.001:
+                    self._stop_capture_event.wait(timeout=rem)
         finally:
             cap.close()
 
@@ -2549,7 +2933,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
             except queue.Empty:
                 break
             if kind == "azeroth_overview_loaded":
-                ov = payload
+                ov, rgba = payload
                 if ov is not None:
                     if self._azeroth_overview is not None:
                         self._azeroth_overview.close()
@@ -2557,30 +2941,35 @@ class ForeverNavigatorQtWindow(QMainWindow):
                     self._overview_pan_x = ov.width * 0.5
                     self._overview_pan_y = ov.height * 0.5
                     self._overview_zoom = 1.0
-                    self.viewport.queue_texture_upload("__azeroth_ov", np.asarray(ov.image, dtype=np.uint8), build_mips=True)
+                    if rgba is not None:
+                        self.viewport.queue_texture_upload_rgba("__azeroth_ov", rgba, build_mips=True)
+                    else:
+                        self.viewport.queue_texture_upload("__azeroth_ov", np.asarray(ov.image, dtype=np.uint8), build_mips=True)
                     needs_update = True
             elif kind == "cont_l1_loaded":
                 cont_slug, res, meta = payload
                 self._cont_l1_loading.discard(cont_slug)
                 if res is not None:
-                    arr, native_px = res
+                    arr_rgba, native_px = res
                     self._cont_l1_native[cont_slug] = native_px
                     if meta is not None:
                         self._cont_meta[cont_slug] = meta
-                    self.viewport.queue_texture_upload(f"__l1_{cont_slug}", arr, build_mips=True)
+                    self.viewport.queue_texture_upload_rgba(f"__l1_{cont_slug}", arr_rgba, build_mips=True)
                     needs_update = True
             elif kind == "deep_tile_ready":
-                req_id, key, arr = payload
-                if req_id == self._deep_tile_req_id and arr is not None and not self._is_interacting:
+                req_id, key, arr_rgba = payload
+                if getattr(self, "_deep_tile_inflight_key", None) == key:
+                    self._deep_tile_inflight_key = None
+                if req_id == self._deep_tile_req_id and arr_rgba is not None and not self._is_interacting:
                     self._deep_tile_key = key
-                    self.viewport.queue_texture_upload("__deep_tile", arr, build_mips=False)
+                    self.viewport.queue_texture_upload_rgba("__deep_tile", arr_rgba, build_mips=False)
                     needs_update = True
             elif kind == "zone_fullres_loaded":
-                slug, arr = payload
+                slug, arr_rgba = payload
                 self._streaming_zones.discard(slug)
-                if arr is not None:
+                if arr_rgba is not None:
                     self._fullres_uploaded_zones.add(slug)
-                    self.viewport.queue_texture_upload(f"zone_{slug}", arr, build_mips=True)
+                    self.viewport.queue_texture_upload_rgba(f"zone_{slug}", arr_rgba, build_mips=True)
                     needs_update = True
             elif kind == "scene_3d_prepared":
                 slug, prepared, err = payload
@@ -2776,7 +3165,8 @@ def run_qt_app(index_dir: str | Path = "data/index", fps: Optional[float] = None
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
     fmt.setDepthBufferSize(24)
-    fmt.setSwapInterval(1)
+    # Windows DWM already VSync-composites desktop windows; swapInterval(0) avoids stalling the Qt GUI thread
+    fmt.setSwapInterval(0)
     QSurfaceFormat.setDefaultFormat(fmt)
 
     app = QApplication.instance() or QApplication(sys.argv)

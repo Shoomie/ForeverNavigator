@@ -232,7 +232,7 @@ class _LoadedGPUScene:
 
         tex_by_fdid: Dict[int, moderngl.Texture] = {}
         for fdid, arr in prepared["textures"].items():
-            tex = ctx.texture((arr.shape[1], arr.shape[0]), 4, arr.tobytes())
+            tex = ctx.texture((arr.shape[1], arr.shape[0]), 4, arr)
             tex.repeat_x = True
             tex.repeat_y = True
             tex.build_mipmaps()
@@ -240,21 +240,35 @@ class _LoadedGPUScene:
             tex_by_fdid[fdid] = tex
             obj._textures.append(tex)
 
-        mat_to_fdid: Dict[int, int] = prepared["mat_to_fdid"]
-        for mesh in prepared["meshes"]:
-            vbo = ctx.buffer(mesh["vbo_bytes"])
+        if "merged_vbo" in prepared:
+            vbo = ctx.buffer(prepared["merged_vbo"])
             obj._buffers.append(vbo)
-            for mat_id, ibo_bytes in mesh["batches"]:
-                ibo = ctx.buffer(ibo_bytes)
+            for fdid, ibo_arr in prepared["merged_batches"]:
+                ibo = ctx.buffer(ibo_arr)
                 obj._buffers.append(ibo)
                 vao = ctx.vertex_array(
                     prog,
                     [(vbo, "3f 3f 2f 4f", "in_pos", "in_norm", "in_uv", "in_col")],
                     index_buffer=ibo,
                 )
-                fdid = mat_to_fdid.get(mat_id)
                 tex = tex_by_fdid.get(fdid, default_tex) if fdid is not None else default_tex
                 obj.draw_calls.append((vao, tex))
+        else:
+            mat_to_fdid: Dict[int, int] = prepared["mat_to_fdid"]
+            for mesh in prepared["meshes"]:
+                vbo = ctx.buffer(mesh["vbo_bytes"])
+                obj._buffers.append(vbo)
+                for mat_id, ibo_bytes in mesh["batches"]:
+                    ibo = ctx.buffer(ibo_bytes)
+                    obj._buffers.append(ibo)
+                    vao = ctx.vertex_array(
+                        prog,
+                        [(vbo, "3f 3f 2f 4f", "in_pos", "in_norm", "in_uv", "in_col")],
+                        index_buffer=ibo,
+                    )
+                    fdid = mat_to_fdid.get(mat_id)
+                    tex = tex_by_fdid.get(fdid, default_tex) if fdid is not None else default_tex
+                    obj.draw_calls.append((vao, tex))
         return obj
 
     def release(self) -> None:
@@ -507,13 +521,16 @@ class GPU3DViewer:
         self._fbo.use()
         self.ctx.viewport = (0, 0, width, height)
         self.ctx.clear(0.07, 0.08, 0.11, 1.0)
-        self.prog["u_mvp"].write(mvp.astype("f4").tobytes())
+        self.prog["u_mvp"].write(np.ascontiguousarray(mvp, dtype=np.float32))
         self.prog["u_cutaway"].value = 1 if self.cutaway_ceilings else 0
         self.prog["u_brightness"].value = float(self.brightness)
         self.prog["u_tex"].value = 0
 
+        last_tex = None
         for vao, tex in scene.draw_calls:
-            tex.use(location=0)
+            if tex is not last_tex:
+                tex.use(location=0)
+                last_tex = tex
             vao.render()
 
         raw = self._fbo.read(components=3)
@@ -706,16 +723,35 @@ class GPU3DViewer:
             except Exception:
                 continue
 
-        meshes: List[Dict[str, Any]] = []
+        # Merge all WMO group vertices into one VBO and coalesce index batches by texture FDID
+        # (reduces draw calls from 100-1000+ down to 1 per unique texture!)
+        vbo_chunks: List[np.ndarray] = []
+        idx_by_tex: Dict[Optional[int], List[np.ndarray]] = {}
+        vert_offset = 0
         for g in groups:
-            interleaved = np.hstack([g.vertices, g.normals, g.uvs, g.vertex_colors]).astype(np.float32)
-            batches = []
+            interleaved = np.ascontiguousarray(
+                np.hstack([g.vertices, g.normals, g.uvs, g.vertex_colors]),
+                dtype=np.float32,
+            )
+            group_has_batch = False
             for b in g.batches:
                 sub_idx = g.indices[b.start_index : b.start_index + b.count]
                 if len(sub_idx) >= 3:
-                    batches.append((b.material_id, sub_idx.astype(np.uint32).tobytes()))
-            if batches:
-                meshes.append({"vbo_bytes": interleaved.tobytes(), "batches": batches})
+                    group_has_batch = True
+                    t_fdid = mat_to_fdid.get(b.material_id)
+                    if t_fdid not in textures:
+                        t_fdid = None
+                    shifted = sub_idx.astype(np.uint32) + np.uint32(vert_offset)
+                    idx_by_tex.setdefault(t_fdid, []).append(shifted)
+            if group_has_batch:
+                vbo_chunks.append(interleaved)
+                vert_offset += len(interleaved)
+
+        merged_vbo = np.ascontiguousarray(np.concatenate(vbo_chunks, axis=0), dtype=np.float32) if vbo_chunks else np.empty((0, 12), dtype=np.float32)
+        merged_batches: List[Tuple[Optional[int], np.ndarray]] = [
+            (t_fdid, np.ascontiguousarray(np.concatenate(chunks, axis=0), dtype=np.uint32))
+            for t_fdid, chunks in idx_by_tex.items()
+        ]
 
         return {
             "bbox_min": bbox_min,
@@ -724,7 +760,8 @@ class GPU3DViewer:
             "radius": radius,
             "textures": textures,
             "mat_to_fdid": mat_to_fdid,
-            "meshes": meshes,
+            "merged_vbo": merged_vbo,
+            "merged_batches": merged_batches,
         }, None
 
     def upload_prepared_scene(self, ctx: moderngl.Context, slug: str, prepared: Dict[str, Any]) -> None:
@@ -790,13 +827,16 @@ class GPU3DViewer:
         fbo.use()
         ctx.enable(moderngl.DEPTH_TEST)
         fbo.clear(0.07, 0.08, 0.11, 1.0, depth=1.0)
-        self.prog["u_mvp"].write(mvp.astype("f4").tobytes())
+        self.prog["u_mvp"].write(np.ascontiguousarray(mvp, dtype=np.float32))
         self.prog["u_cutaway"].value = 1 if self.cutaway_ceilings else 0
         self.prog["u_brightness"].value = float(self.brightness)
         self.prog["u_tex"].value = 0
 
+        last_tex = None
         for vao, tex in scene.draw_calls:
-            tex.use(location=0)
+            if tex is not last_tex:
+                tex.use(location=0)
+                last_tex = tex
             vao.render()
 
         ctx.disable(moderngl.DEPTH_TEST)
