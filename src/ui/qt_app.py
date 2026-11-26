@@ -1036,7 +1036,15 @@ class ForeverNavigatorQtWindow(QMainWindow):
             high_precision=self.settings.high_precision,
             lazy_precompute=True,
             neural_model_name=self.settings.neural_model_name or None,
+            use_opencv=self.settings.use_opencv_refine,
+            opencv_verify_only=self.settings.opencv_verify_only,
+            use_verifier_neural=self.settings.use_verifier_neural,
+            neural_max_hz=self.settings.neural_max_hz,
+            verifier_hz=self.settings.verifier_hz,
         )
+        self._capture_backend: str = "init"
+        self._capture_ms_ema: float = 0.0
+        self._last_tel_ui_t: float = 0.0
         self.viewer_3d = GPU3DViewer(wow_dir=self.wow_dir, listfile_path=self.data_dir / "listfile.csv", product="wowf")
         try:
             from ..navigator.world_maps import WorldMapRegistry
@@ -1238,12 +1246,12 @@ class ForeverNavigatorQtWindow(QMainWindow):
         cl.addLayout(opt_row)
 
         opt2 = QHBoxLayout()
-        self.chk_neural = QCheckBox("Neural AI")
+        self.chk_neural = QCheckBox("AI")
         has_nn = getattr(self.tracker_mm, "_neural", None) is not None
         self.chk_neural.setChecked(bool(self.settings.use_neural_model) and has_nn)
         self.chk_neural.setEnabled(has_nn)
         self.chk_neural.setToolTip(
-            "Use trained ONNX neural model + OpenCV refinement (uncheck for Classic OpenCV only)"
+            "Enable trained ONNX Neural AI localizer"
             if has_nn
             else "No ONNX model found in data/models/"
         )
@@ -1251,6 +1259,14 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.chk_neural.toggled.connect(self._toggle_neural_model)
         self.tracker_mm.set_use_neural(self.chk_neural.isChecked())
         opt2.addWidget(self.chk_neural)
+
+        self.chk_opencv = QCheckBox("ImgRec")
+        self.chk_opencv.setChecked(bool(self.settings.use_opencv_refine))
+        self.chk_opencv.setToolTip("Enable OpenCV template-matching image recognition (uncheck for Pure AI only)")
+        self.chk_opencv.setStyleSheet("color: #f0b429;")
+        self.chk_opencv.toggled.connect(self._toggle_opencv_refine)
+        self.tracker_mm.set_use_opencv(self.chk_opencv.isChecked())
+        opt2.addWidget(self.chk_opencv)
 
         self.chk_anchor = QCheckBox("Anchor")
         self.chk_anchor.setChecked(bool(self.settings.periodic_opencv_anchor))
@@ -1265,7 +1281,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.chk_hiprec.setStyleSheet("color: #58a6ff;")
         self.chk_hiprec.toggled.connect(self._toggle_high_precision)
         opt2.addWidget(self.chk_hiprec)
-        opt2.addWidget(QLabel("Storage:"))
+        cl.addLayout(opt2)
+
+        opt2b = QHBoxLayout()
+        opt2b.addWidget(QLabel("Storage:"))
         auto_lbl = f"Auto ({self._detected_storage.upper()})"
         self._storage_label_to_mode = {auto_lbl: "auto", "SSD (Low RAM)": "ssd", "HDD (More Cache)": "hdd"}
         mode_to_lbl = {v: k for k, v in self._storage_label_to_mode.items()}
@@ -1273,29 +1292,88 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.cb_storage.addItems(list(self._storage_label_to_mode.keys()))
         self.cb_storage.setCurrentText(mode_to_lbl.get(self.settings.storage_mode, auto_lbl))
         self.cb_storage.currentTextChanged.connect(self._on_storage_mode_change)
-        opt2.addWidget(self.cb_storage, 1)
-        cl.addLayout(opt2)
+        opt2b.addWidget(self.cb_storage, 1)
+        cl.addLayout(opt2b)
 
         opt3 = QHBoxLayout()
-        opt3.addWidget(QLabel("Polling:"))
+        opt3.addWidget(QLabel("Poll:"))
         self._fps_presets = [
-            ("1 Hz (Eco)", 1.0),
-            ("2 Hz (Standard)", 2.0),
-            ("5 Hz (Responsive)", 5.0),
-            ("10 Hz (Smooth)", 10.0),
-            ("15 Hz (Fast)", 15.0),
-            ("30 Hz (High Polling)", 30.0),
-            ("60 Hz (Extreme Polling)", 60.0),
+            ("1 Hz", 1.0),
+            ("2 Hz", 2.0),
+            ("5 Hz", 5.0),
+            ("10 Hz", 10.0),
+            ("15 Hz", 15.0),
+            ("30 Hz", 30.0),
+            ("60 Hz", 60.0),
         ]
         self._fps_label_to_val = {lbl: val for lbl, val in self._fps_presets}
         self.cb_fps = QComboBox()
         self.cb_fps.addItems([lbl for lbl, _ in self._fps_presets])
-        # Pick closest preset to saved self.fps
         best_lbl = min(self._fps_presets, key=lambda kv: abs(kv[1] - self.fps))[0]
         self.cb_fps.setCurrentText(best_lbl)
+        self.cb_fps.setToolTip("Overall screen capture & OpenCV image-recognition target rate")
         self.cb_fps.currentTextChanged.connect(self._on_fps_change)
         opt3.addWidget(self.cb_fps, 1)
+
+        opt3.addWidget(QLabel("AI:"))
+        self._ai_hz_presets = [
+            ("Sync", 0.0),
+            ("30 Hz", 30.0),
+            ("15 Hz", 15.0),
+            ("12 Hz", 12.0),
+            ("5 Hz", 5.0),
+            ("2 Hz", 2.0),
+            ("1 Hz", 1.0),
+        ]
+        self._ai_hz_label_to_val = {lbl: val for lbl, val in self._ai_hz_presets}
+        self.cb_ai_hz = QComboBox()
+        self.cb_ai_hz.addItems([lbl for lbl, _ in self._ai_hz_presets])
+        best_ai_lbl = min(self._ai_hz_presets, key=lambda kv: abs(kv[1] - self.settings.neural_max_hz))[0]
+        self.cb_ai_hz.setCurrentText(best_ai_lbl)
+        self.cb_ai_hz.setToolTip("Max polling rate for the Neural AI model (Sync = run on every capture frame)")
+        self.cb_ai_hz.currentTextChanged.connect(self._on_ai_hz_change)
+        opt3.addWidget(self.cb_ai_hz, 1)
+        opt3.addWidget(QLabel("Ver:"))
+        self._ver_hz_presets = [
+            ("Off", 0.0),
+            ("0.5 Hz", 0.5),
+            ("1 Hz", 1.0),
+            ("2 Hz", 2.0),
+            ("5 Hz", 5.0),
+            ("10 Hz", 10.0),
+        ]
+        self._ver_hz_label_to_val = {lbl: val for lbl, val in self._ver_hz_presets}
+        self.cb_ver_hz = QComboBox()
+        self.cb_ver_hz.addItems([lbl for lbl, _ in self._ver_hz_presets])
+        best_ver_lbl = min(self._ver_hz_presets, key=lambda kv: abs(kv[1] - self.settings.verifier_hz))[0]
+        self.cb_ver_hz.setCurrentText(best_ver_lbl)
+        self.cb_ver_hz.setToolTip("Periodic verification rate for Accurate AI and/or Classic ImgRec (always < primary AI Hz)")
+        self.cb_ver_hz.currentTextChanged.connect(self._on_ver_hz_change)
+        opt3.addWidget(self.cb_ver_hz, 1)
         cl.addLayout(opt3)
+
+        opt_pipe = QHBoxLayout()
+        opt_pipe.addWidget(QLabel("Pipeline:"))
+        self._pipeline_presets = [
+            ("Hybrid (AI + 60Hz ImgRec)", "hybrid_60hz_cv"),
+            ("Accurate AI + Classic Ver", "accurate_plus_classic"),
+            ("Fast v2 + Accurate AI Ver", "fast_plus_accurate"),
+            ("Fast v2 + Acc AI + Classic", "fast_plus_accurate_classic"),
+            ("Pure Accurate AI (GPU)", "pure_accurate_ai"),
+        ]
+        self._pipe_label_to_key = {lbl: key for lbl, key in self._pipeline_presets}
+        self._pipe_key_to_label = {key: lbl for lbl, key in self._pipeline_presets}
+        self.cb_pipeline = QComboBox()
+        self.cb_pipeline.addItems([lbl for lbl, _ in self._pipeline_presets])
+        self.cb_pipeline.setCurrentText(self._pipe_key_to_label.get(self.settings.pipeline_preset, "Hybrid (AI + 60Hz ImgRec)"))
+        self.cb_pipeline.setToolTip("One-click tracking & verification architecture preset")
+        self.cb_pipeline.currentTextChanged.connect(self._on_pipeline_preset_change)
+        opt_pipe.addWidget(self.cb_pipeline, 1)
+        cl.addLayout(opt_pipe)
+
+        self.lbl_telemetry = QLabel("AI: 0.0 Hz (0ms) | ImgRec: 0.0 Hz (0ms) | Idle")
+        self.lbl_telemetry.setStyleSheet("color: #8b949e; font-family: Consolas, monospace; font-size: 7.5pt; padding: 2px 0px;")
+        cl.addWidget(self.lbl_telemetry)
 
         from ..navigator.neural_localizer import format_model_label, list_available_onnx_models
 
@@ -1920,6 +1998,93 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.tracker_mm.set_periodic_anchor(bool(enabled))
         self.lbl_stats.setText(f"Periodic OpenCV Anchor: {'ON (~2.5s)' if enabled else 'OFF (Max FPS)'}")
 
+    def _toggle_opencv_refine(self, enabled: bool) -> None:
+        self.settings.use_opencv_refine = bool(enabled)
+        save_settings(self.settings_path, self.settings)
+        self.tracker_mm.set_use_opencv(bool(enabled))
+        self.lbl_stats.setText(f"Image Recognition (OpenCV): {'ON' if enabled else 'OFF (Pure AI)'}")
+
+    def _on_ai_hz_change(self, label: str) -> None:
+        val = self._ai_hz_label_to_val.get(label, 0.0)
+        self.settings.neural_max_hz = float(val)
+        save_settings(self.settings_path, self.settings)
+        self.tracker_mm.set_neural_max_hz(float(val))
+        self.lbl_stats.setText(f"AI Model Rate Cap: {'Match Poll' if val <= 0 else f'{val:.0f} Hz'}")
+
+    def _on_ver_hz_change(self, label: str) -> None:
+        val = self._ver_hz_label_to_val.get(label, 2.0)
+        self.settings.verifier_hz = float(val)
+        save_settings(self.settings_path, self.settings)
+        self.tracker_mm.set_verifier_hz(float(val))
+        self.lbl_stats.setText(f"Verifier Rate: {'OFF' if val <= 0 else f'{val:g} Hz'}")
+
+    def _on_pipeline_preset_change(self, label: str) -> None:
+        key = self._pipe_label_to_key.get(label, "hybrid_60hz_cv")
+        self.settings.pipeline_preset = key
+        models_dir = self.data_dir / "models"
+        if key == "accurate_plus_classic":
+            self._select_model_stem_ui("forever_minimap_v2_accurate", models_dir)
+            self.settings.use_neural_model = True
+            self.settings.use_opencv_refine = True
+            self.settings.opencv_verify_only = True
+            self.settings.use_verifier_neural = False
+            self.settings.neural_max_hz = 0.0
+        elif key == "fast_plus_accurate":
+            self._select_model_stem_ui("forever_minimap_v2_fast", models_dir)
+            self.settings.use_neural_model = True
+            self.settings.use_opencv_refine = False
+            self.settings.opencv_verify_only = True
+            self.settings.use_verifier_neural = True
+            self.settings.neural_max_hz = 0.0
+        elif key == "fast_plus_accurate_classic":
+            self._select_model_stem_ui("forever_minimap_v2_fast", models_dir)
+            self.settings.use_neural_model = True
+            self.settings.use_opencv_refine = True
+            self.settings.opencv_verify_only = True
+            self.settings.use_verifier_neural = True
+            self.settings.neural_max_hz = 0.0
+        elif key == "pure_accurate_ai":
+            self._select_model_stem_ui("forever_minimap_v2_accurate", models_dir)
+            self.settings.use_neural_model = True
+            self.settings.use_opencv_refine = False
+            self.settings.opencv_verify_only = True
+            self.settings.use_verifier_neural = False
+            self.settings.neural_max_hz = 0.0
+        else:  # hybrid_60hz_cv
+            self.settings.use_neural_model = True
+            self.settings.use_opencv_refine = True
+            self.settings.opencv_verify_only = False
+            self.settings.use_verifier_neural = False
+
+        # Apply to tracker & sync checkboxes without re-triggering cascade
+        self.tracker_mm.set_use_neural(self.settings.use_neural_model)
+        self.tracker_mm.set_use_opencv(self.settings.use_opencv_refine)
+        self.tracker_mm.set_opencv_verify_only(self.settings.opencv_verify_only)
+        self.tracker_mm.set_use_verifier_neural(self.settings.use_verifier_neural, models_dir=models_dir)
+        self.tracker_mm.set_neural_max_hz(self.settings.neural_max_hz)
+        self.chk_neural.blockSignals(True)
+        self.chk_neural.setChecked(self.settings.use_neural_model)
+        self.chk_neural.blockSignals(False)
+        self.chk_opencv.blockSignals(True)
+        self.chk_opencv.setChecked(self.settings.use_opencv_refine)
+        self.chk_opencv.blockSignals(False)
+        self.cb_ai_hz.blockSignals(True)
+        best_ai_lbl = min(self._ai_hz_presets, key=lambda kv: abs(kv[1] - self.settings.neural_max_hz))[0]
+        self.cb_ai_hz.setCurrentText(best_ai_lbl)
+        self.cb_ai_hz.blockSignals(False)
+        save_settings(self.settings_path, self.settings)
+        self.lbl_stats.setText(f"Pipeline -> {label}")
+
+    def _select_model_stem_ui(self, stem: str, models_dir: Path) -> None:
+        for lbl, s in self._model_label_to_stem.items():
+            if s == stem:
+                self.tracker_mm.set_neural_model(stem, models_dir=models_dir)
+                self.settings.neural_model_name = stem
+                self.cb_model.blockSignals(True)
+                self.cb_model.setCurrentText(lbl)
+                self.cb_model.blockSignals(False)
+                return
+
     def _on_neural_model_change(self, label: str) -> None:
         stem = self._model_label_to_stem.get(label, "")
         if not stem:
@@ -2174,7 +2339,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
     def _capture_loop(self) -> None:
         last_fs_grab_t = 0.0
+        last_db_rec_t = 0.0
+        last_db_slug = ""
         cap = FastScreenCapturer(self._selected_monitor)
+        self._capture_backend = cap.backend.upper()
         self._ui_queue.put(("log", f"Capture backend: {cap.backend.upper()} ({self.fps:.0f} Hz target)"))
         try:
             while self.running:
@@ -2184,6 +2352,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
                     roi = self.tracker_mm.roi
                     mm_rgb = cap.grab_roi(self._selected_monitor, roi.x0, roi.y0, roi.x1, roi.y1)
                     capture_ms = (time.perf_counter() - t0) * 1000.0
+                    self._capture_ms_ema = (
+                        capture_ms if self._capture_ms_ema <= 0.0 else 0.25 * capture_ms + 0.75 * self._capture_ms_ema
+                    )
+                    self._capture_backend = cap.backend.upper()
                     est = self.tracker_mm.update(mm_rgb, is_already_cropped=True)
                     if self.dev_logger.enabled:
                         full_rgb = None
@@ -2208,7 +2380,11 @@ class ForeverNavigatorQtWindow(QMainWindow):
                         confidence=est.position_confidence,
                         t_host_ms=self.client.host_now_ms() if self.client else now_ms(),
                     )
-                    self.session_store.record_position(st)
+                    # Record replay positions at <= 4 Hz (or on zone change) instead of 60 SQLite writes/sec
+                    if (t0 - last_db_rec_t) >= 0.25 or est.dungeon_slug != last_db_slug:
+                        self.session_store.record_position(st)
+                        last_db_rec_t = t0
+                        last_db_slug = est.dungeon_slug
                     if self.server:
                         self.server.update_host_position_sync(st)
                     elif self.client:
@@ -2217,9 +2393,13 @@ class ForeverNavigatorQtWindow(QMainWindow):
                         self._latest_est = est
                 except Exception as exc:
                     self.dev_logger.log_event("capture_error", {"error": str(exc)})
-                rem = interval - (time.perf_counter() - t0)
-                if rem > 0:
-                    self._stop_capture_event.wait(timeout=rem)
+                target_end = t0 + interval
+                rem = target_end - time.perf_counter()
+                if rem > 0.002:
+                    self._stop_capture_event.wait(timeout=rem - (0.0015 if self.fps >= 20.0 else 0.0))
+                if self.fps >= 20.0 and self.running:
+                    while time.perf_counter() < target_end and not self._stop_capture_event.is_set():
+                        time.sleep(0)
         finally:
             cap.close()
 
@@ -2231,17 +2411,22 @@ class ForeverNavigatorQtWindow(QMainWindow):
         if est is None:
             return
         is_new_est = (est is not self._last_rendered_est)
+        now_ui = time.perf_counter()
+        if (now_ui - getattr(self, "_last_tel_ui_t", 0.0)) >= 0.25:
+            self._last_tel_ui_t = now_ui
+            tel = self.tracker_mm.get_telemetry()
+            cap_ms = getattr(self, "_capture_ms_ema", 0.0)
+            backend = getattr(self, "_capture_backend", "")
+            ver_part = f" | VerAI: {tel['ver_neural_hz']:.1f}Hz ({tel['ver_neural_ms']:.0f}ms)" if tel["ver_neural_hz"] > 0 else ""
+            self.lbl_telemetry.setText(
+                f"AI[{tel['provider']}]: {tel['neural_hz']:.1f}Hz ({tel['neural_ms']:.1f}ms){ver_part} | "
+                f"CV: {tel['cv_hz']:.1f}Hz ({tel['cv_ms']:.1f}ms) | Cap:{cap_ms:.1f}ms [{backend}•{tel['mode_tag']}]"
+            )
+            self.pill_fps.setText(f"AI {tel['neural_hz']:.0f} | CV {tel['cv_hz']:.0f} Hz [{tel['provider']}]")
+
         if is_new_est:
             self._last_rendered_est = est
             self.pill_pos.setText(f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%")
-            now_fps = time.perf_counter()
-            prev_fps_t = getattr(self, "_last_est_wall_t", None)
-            self._last_est_wall_t = now_fps
-            if prev_fps_t is not None and (now_fps - prev_fps_t) > 1e-4:
-                inst_hz = 1.0 / (now_fps - prev_fps_t)
-                ema = getattr(self, "_measured_hz", inst_hz)
-                self._measured_hz = 0.25 * inst_hz + 0.75 * ema
-                self.pill_fps.setText(f"{self._measured_hz:.1f} / {self.fps:.0f} Hz")
             self.lbl_dungeon.setText(f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]")
 
         # Sub-pixel 60 FPS visual interpolation toward the latest tracker position (eliminates visual judder!)

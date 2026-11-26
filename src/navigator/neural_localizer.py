@@ -126,6 +126,7 @@ class NeuralMinimapLocalizer:
         self.model_path: Optional[Path] = None
         self.meta_path: Optional[Path] = None
         self.model_stem: str = ""
+        self.active_provider: str = "CPU"
         self.crop_size: int = 224
         self.id_to_slug: Dict[int, str] = {}
         self.slug_to_id: Dict[str, int] = {}
@@ -163,9 +164,20 @@ class NeuralMinimapLocalizer:
             providers = [p for p in ("DmlExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider") if p in avail_providers]
             if not providers:
                 providers = ["CPUExecutionProvider"]
+            if "DmlExecutionProvider" in providers:
+                # Recommended DirectML session flags for Windows thread safety & stable VRAM
+                opts.enable_mem_pattern = False
+                opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
             self._sess = ort.InferenceSession(str(self.model_path), sess_options=opts, providers=providers)
             self._input_name = self._sess.get_inputs()[0].name
+            active = self._sess.get_providers()
+            if active and active[0] == "DmlExecutionProvider":
+                self.active_provider = "GPU-DML"
+            elif active and active[0] == "CUDAExecutionProvider":
+                self.active_provider = "GPU-CUDA"
+            else:
+                self.active_provider = "CPU"
             self.available = True
         except Exception:
             self._sess = None

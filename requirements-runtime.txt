@@ -2,7 +2,8 @@ numpy>=1.26
 pillow>=10.0
 opencv-python-headless>=4.9
 mss>=9.0
-onnxruntime>=1.18
+onnxruntime-directml>=1.19; sys_platform == "win32"
+onnxruntime>=1.18; sys_platform != "win32"
 moderngl>=5.10
 pyrr>=0.10
 websockets>=13.0

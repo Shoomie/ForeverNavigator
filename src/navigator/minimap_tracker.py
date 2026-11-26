@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,6 +126,11 @@ class MinimapTracker:
         neural_localizer: Optional[NeuralMinimapLocalizer] = None,
         neural_model_name: Optional[str] = None,
         use_neural: bool = True,
+        use_opencv: bool = True,
+        opencv_verify_only: bool = False,
+        use_verifier_neural: bool = False,
+        neural_max_hz: float = 0.0,
+        verifier_hz: float = 2.0,
         periodic_anchor: bool = True,
         anchor_interval_sec: float = 2.5,
     ):
@@ -137,6 +143,11 @@ class MinimapTracker:
         self.use_gpu = bool(use_gpu)
         self.lazy_precompute = bool(lazy_precompute)
         self.use_neural = bool(use_neural)
+        self.use_opencv = bool(use_opencv)
+        self.opencv_verify_only = bool(opencv_verify_only)
+        self.use_verifier_neural = bool(use_verifier_neural)
+        self.neural_max_hz = max(0.0, float(neural_max_hz))
+        self.verifier_hz = max(0.0, float(verifier_hz))
         self.periodic_anchor = bool(periodic_anchor)
         self.anchor_interval_sec = max(0.5, float(anchor_interval_sec))
         self._last_anchor_t: float = 0.0
@@ -147,12 +158,26 @@ class MinimapTracker:
         )
         if self._neural is not None and not self._neural.available:
             self._neural = None
+        self._verifier_neural: Optional[NeuralMinimapLocalizer] = None
+        if self.use_verifier_neural:
+            self._ensure_verifier_neural()
         self.last_heading_deg: Optional[float] = None
         self.last_neural_pred: Optional[NeuralPrediction] = None
+        self.last_verifier_pred: Optional[NeuralPrediction] = None
         self.last_smooth_px: Optional[Tuple[float, float]] = None
         self._last_neural_run_t: float = 0.0
+        self._last_verify_run_t: float = 0.0
         self._locked_zoom_yd: Optional[float] = None
         self._last_zoom_check_t: float = 0.0
+        # Live per-engine telemetry (1.5s sliding window)
+        self._neural_ticks: deque[float] = deque(maxlen=240)
+        self._ver_neural_ticks: deque[float] = deque(maxlen=240)
+        self._cv_ticks: deque[float] = deque(maxlen=240)
+        self._total_ticks: deque[float] = deque(maxlen=240)
+        self._neural_ms_ema: float = 0.0
+        self._ver_neural_ms_ema: float = 0.0
+        self._cv_ms_ema: float = 0.0
+        self.last_mode_tag: str = "Idle"
         self._lock = threading.RLock()
         self._executor: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(max_workers=min(12, max(2, os.cpu_count() or 4)), thread_name_prefix="MMTrack")
@@ -201,12 +226,88 @@ class MinimapTracker:
         self._last_outdoor_world_pos: Optional[np.ndarray] = None
 
     def set_use_neural(self, enabled: bool) -> None:
-        """Toggle between Hybrid Neural ONNX + OpenCV and Classic Pure OpenCV tracking live."""
+        """Toggle Neural ONNX AI model ON/OFF live."""
         with self._lock:
             self.use_neural = bool(enabled)
             if not self.use_neural:
                 self.last_heading_deg = None
                 self.last_neural_pred = None
+
+    def set_use_opencv(self, enabled: bool) -> None:
+        """Toggle OpenCV image-recognition refinement ON/OFF live."""
+        with self._lock:
+            self.use_opencv = bool(enabled)
+
+    def set_opencv_verify_only(self, enabled: bool) -> None:
+        """When True, OpenCV runs only at `verifier_hz` instead of every frame (AI-primary mode)."""
+        with self._lock:
+            self.opencv_verify_only = bool(enabled)
+
+    def set_use_verifier_neural(self, enabled: bool, models_dir: str | Path = "data/models") -> bool:
+        """Toggle secondary Accurate AI verifier model (`forever_minimap_v2_accurate`) live."""
+        enabled = bool(enabled)
+        if enabled:
+            ok = self._ensure_verifier_neural(models_dir=models_dir)
+            with self._lock:
+                self.use_verifier_neural = ok
+            return ok
+        with self._lock:
+            self.use_verifier_neural = False
+            self.last_verifier_pred = None
+        return True
+
+    def _ensure_verifier_neural(self, models_dir: str | Path = "data/models") -> bool:
+        if self._verifier_neural is not None and self._verifier_neural.available:
+            return True
+        vn = NeuralMinimapLocalizer(models_dir=models_dir, preferred_stem="forever_minimap_v2_accurate")
+        if vn.available and vn.model_stem == "forever_minimap_v2_accurate":
+            self._verifier_neural = vn
+            return True
+        return False
+
+    def set_neural_max_hz(self, max_hz: float) -> None:
+        """Set max polling rate for the primary Neural AI model (0.0 = run every capture frame)."""
+        with self._lock:
+            self.neural_max_hz = max(0.0, float(max_hz))
+
+    def set_verifier_hz(self, hz: float) -> None:
+        """Set periodic verification rate (Hz) for Accurate AI and/or Classic OpenCV verifiers."""
+        with self._lock:
+            self.verifier_hz = max(0.0, float(hz))
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Return live sliding-window polling rates (Hz) and EMA latencies (ms) for all engines."""
+        now = time.perf_counter()
+        win = 1.5
+
+        def _rate(dq: deque[float]) -> float:
+            while dq and (now - dq[0]) > win:
+                dq.popleft()
+            if not dq:
+                return 0.0
+            span = max(0.35, now - dq[0]) if len(dq) > 1 else win
+            return float(len(dq)) / min(win, span)
+
+        with self._lock:
+            nn_hz = _rate(self._neural_ticks)
+            ver_hz = _rate(self._ver_neural_ticks)
+            cv_hz = _rate(self._cv_ticks)
+            tot_hz = _rate(self._total_ticks)
+            pred = self.last_neural_pred
+            prov = self._neural.active_provider if (self._neural is not None and self._neural.available) else "CPU"
+            return {
+                "total_hz": round(tot_hz, 1),
+                "neural_hz": round(nn_hz, 1),
+                "neural_ms": round(self._neural_ms_ema, 1),
+                "ver_neural_hz": round(ver_hz, 1),
+                "ver_neural_ms": round(self._ver_neural_ms_ema, 1),
+                "cv_hz": round(cv_hz, 1),
+                "cv_ms": round(self._cv_ms_ema, 1),
+                "provider": prov,
+                "mode_tag": self.last_mode_tag,
+                "neural_prob": round(pred.best_prob, 2) if pred is not None else 0.0,
+                "neural_slug": pred.best_slug if pred is not None else "",
+            }
 
     def set_periodic_anchor(self, enabled: bool) -> None:
         """Toggle periodic full-map geometric OpenCV anchor stabilization (~every 2.5s)."""
@@ -603,16 +704,26 @@ class MinimapTracker:
         ch, cw = crop.shape[:2]
 
         # Optional ultra-fast ONNX neural pre-pass: auto-centers minimap inside any ROI + top-K zones!
-        # At high polling rates (>=18 Hz) with a strong active lock, pace ONNX at ~12 Hz while local
-        # sub-pixel OpenCV runs every frame (~3 ms) -> sustains true 60 Hz with minimal CPU!
+        # Honors `self.neural_max_hz` when locked on active_slug (0.0 = run every capture frame).
         neural_pred: Optional[NeuralPrediction] = None
+        # Compute periodic verifier tick (strictly slower than primary AI rate when AI is capped)
+        eff_ver_hz = self.verifier_hz
+        if self.use_neural and self.neural_max_hz > 0.0 and eff_ver_hz >= self.neural_max_hz:
+            eff_ver_hz = max(0.25, self.neural_max_hz * 0.5)
+        is_verify_tick = (eff_ver_hz > 0.0) and ((t0 - self._last_verify_run_t) >= (1.0 / eff_ver_hz))
+        ran_ver_nn = False
+
         if self.use_neural and self._neural is not None and self._neural.available:
+            min_nn_dt = (1.0 / self.neural_max_hz) if self.neural_max_hz > 0.0 else 0.0
             reuse_cached_nn = (
-                self.last_neural_pred is not None
+                self.use_opencv
+                and not self.opencv_verify_only
+                and min_nn_dt > 0.0
+                and self.last_neural_pred is not None
                 and self._smooth_px is not None
                 and self.last_neural_pred.best_slug == self.active_slug
                 and self.last_neural_pred.best_prob >= 0.55
-                and (t0 - self._last_neural_run_t) < 0.085
+                and (t0 - self._last_neural_run_t) < min_nn_dt
             )
             if reuse_cached_nn:
                 neural_pred = self.last_neural_pred
@@ -620,6 +731,39 @@ class MinimapTracker:
                 neural_pred = self._neural.predict(crop, top_k=5)
                 self.last_neural_pred = neural_pred
                 self._last_neural_run_t = t0
+                if neural_pred is not None:
+                    with self._lock:
+                        self._neural_ticks.append(time.perf_counter())
+                        self._neural_ms_ema = (
+                            neural_pred.inference_ms
+                            if self._neural_ms_ema <= 0.0
+                            else 0.25 * neural_pred.inference_ms + 0.75 * self._neural_ms_ema
+                        )
+
+            # Optional secondary Accurate AI verifier (`forever_minimap_v2_accurate`) on verifier ticks
+            if (
+                is_verify_tick
+                and self.use_verifier_neural
+                and self._verifier_neural is not None
+                and self._verifier_neural.available
+                and self._verifier_neural.model_stem != self._neural.model_stem
+            ):
+                ver_pred = self._verifier_neural.predict(crop, top_k=5)
+                if ver_pred is not None:
+                    ran_ver_nn = True
+                    self.last_verifier_pred = ver_pred
+                    with self._lock:
+                        self._ver_neural_ticks.append(time.perf_counter())
+                        self._ver_neural_ms_ema = (
+                            ver_pred.inference_ms
+                            if self._ver_neural_ms_ema <= 0.0
+                            else 0.25 * ver_pred.inference_ms + 0.75 * self._ver_neural_ms_ema
+                        )
+                    # Accurate AI overrides fast AI when confident
+                    if ver_pred.best_prob >= 0.50:
+                        neural_pred = ver_pred
+                        self.last_neural_pred = ver_pred
+
             if neural_pred is not None and neural_pred.best_prob >= 0.35 and neural_pred.best_slug in self.dungeons:
                 self.last_heading_deg = neural_pred.heading_deg
                 centered = self._neural.extract_autocentered_minimap(crop, neural_pred)
@@ -718,23 +862,26 @@ class MinimapTracker:
             scales_px = tuple(valid_scales)
             prev_wxy = None
             plaus_w = None
-            if not force_full_map:
-                if slug == self.active_slug and self._smooth_px is not None:
-                    prev_wxy = (float(self._smooth_px[0]) / ratio, float(self._smooth_px[1]) / ratio)
-                    plaus_w = (plausible_yd * d.map_scale) / ratio
-                elif (
-                    neural_pred is not None
-                    and neural_pred.best_slug == slug
-                    and neural_pred.best_prob >= 0.50
-                ):
-                    # Seed cold-start / post-cave re-acquisition with the neural (norm_u, norm_v) prediction
-                    prev_wxy = (float(neural_pred.norm_u) * float(w_sz), float(neural_pred.norm_v) * float(w_sz))
-                    plaus_w = max(24.0, float(w_sz) * 0.14)
+            if not force_full_map and slug == self.active_slug and self._smooth_px is not None:
+                prev_wxy = (float(self._smooth_px[0]) / ratio, float(self._smooth_px[1]) / ratio)
+                plaus_w = (plausible_yd * d.map_scale) / ratio
+            # Note: On cold-start / zone switch (self._smooth_px is None), ALWAYS search the full
+            # neural-identified zone (~12-25 ms once) instead of cropping to a narrow box around
+            # neural (norm_u, norm_v), which can be 300-1500 yd off on large outdoor zones!
             sc, xy = self._match_single_dungeon(
                 slug, crop_sil, crop_edge, scales_px, angles_deg,
                 prev_work_xy=prev_wxy, plausible_radius_work=plaus_w,
                 tpl_cache=tpl_cache,
             )
+            # If local match is weak on an already-locked zone, do an immediate full-map re-acquisition
+            if not force_full_map and prev_wxy is not None and sc < 0.50:
+                sc_full, xy_full = self._match_single_dungeon(
+                    slug, crop_sil, crop_edge, scales_px, angles_deg,
+                    prev_work_xy=None, plausible_radius_work=None,
+                    tpl_cache=tpl_cache,
+                )
+                if sc_full > sc + 0.08:
+                    sc, xy = sc_full, xy_full
             # If locked-scale match dipped, immediately fall back to full multi-scale check
             if use_locked_scale and sc < 0.52:
                 self._locked_zoom_yd = None
@@ -764,8 +911,32 @@ class MinimapTracker:
 
         raw_scores: Dict[str, float] = {s: 0.0 for s in order}
         best_xy_by_slug: Dict[str, Tuple[float, float]] = {}
+        t_cv_start = time.perf_counter()
+        ran_cv = False
+        mode_tag = "Full-Scan"
+        run_cv_this_frame = self.use_opencv and (not self.opencv_verify_only or is_verify_tick or self._smooth_px is None)
+        if is_verify_tick and (ran_ver_nn or (self.use_opencv and self.opencv_verify_only)):
+            self._last_verify_run_t = t0
 
-        if locked_slug and locked_slug in self.dungeons:
+        if not run_cv_this_frame and neural_pred is not None and neural_pred.best_slug in self.dungeons:
+            # Pure Neural AI tick (either ImgRec OFF, or between periodic verifier ticks)
+            mode_tag = "AI+VerAI" if ran_ver_nn else "AI-GPU"
+            target_s = locked_slug if (locked_slug and locked_slug in self.dungeons) else neural_pred.best_slug
+            self._ensure_precomputed(target_s)
+            w_sz = float(self._map_sil[target_s].shape[0])
+            for s, p_val in neural_pred.top_slugs:
+                if s in raw_scores:
+                    raw_scores[s] = float(p_val)
+            raw_scores[target_s] = max(raw_scores.get(target_s, 0.0), float(neural_pred.best_prob))
+            if self.use_opencv and self.opencv_verify_only and self._smooth_px is not None and target_s == active_slug:
+                # Keep the exact OpenCV-verified coordinate between verifier ticks rather than jumping to rough neural (u,v)
+                ratio_t = self._scale_ratio.get(target_s, 1.0)
+                best_xy_by_slug[target_s] = (float(self._smooth_px[0]) / ratio_t, float(self._smooth_px[1]) / ratio_t)
+            else:
+                best_xy_by_slug[target_s] = (float(neural_pred.norm_u) * w_sz, float(neural_pred.norm_v) * w_sz)
+        elif locked_slug and locked_slug in self.dungeons:
+            ran_cv = True
+            mode_tag = "Locked-CV"
             sc, xy = eval_fine(locked_slug)
             raw_scores[locked_slug] = sc
             best_xy_by_slug[locked_slug] = xy
@@ -779,12 +950,14 @@ class MinimapTracker:
         ):
             # Inside an unmapped outdoor cave/tunnel (e.g. Searing Gorge Slag Pit, Feralas cave):
             # neural model is clearly uncertain without a loading screen -> skip wasted 36-map scan (~8 ms total!)
+            mode_tag = "Cave-Hold"
             raw_scores[active_slug] = 0.35
             ratio_a = self._scale_ratio.get(active_slug, 1.0)
             best_xy_by_slug[active_slug] = (float(self._smooth_px[0]) / ratio_a, float(self._smooth_px[1]) / ratio_a)
         elif neural_pred is not None and neural_pred.best_prob >= 0.45 and neural_pred.best_slug in self.dungeons:
-            # Hybrid Neural Fast-Path (~10 ms total -> sustains 30-60 Hz polling on CPU!):
+            # Hybrid Neural Fast-Path (~3-10 ms total -> sustains 30-60 Hz polling on CPU!):
             # If neural model strongly agrees with our already-locked active_slug, only refine active_slug locally!
+            ran_cv = True
             prob_map = dict(neural_pred.top_slugs)
             if (
                 neural_pred.best_slug == active_slug
@@ -793,9 +966,11 @@ class MinimapTracker:
             ):
                 do_anchor = self.periodic_anchor and ((now_t - self._last_anchor_t) >= self.anchor_interval_sec)
                 if do_anchor:
+                    mode_tag = "Anchor"
                     self._last_anchor_t = now_t
                     sc_a, xy_a = eval_fine(active_slug, force_full_map=True)
                 else:
+                    mode_tag = "Fast-Lock"
                     sc_a, xy_a = eval_fine(active_slug)
                 raw_scores[active_slug] = 0.72 * sc_a + 0.28 * float(neural_pred.best_prob)
                 best_xy_by_slug[active_slug] = xy_a
@@ -803,6 +978,7 @@ class MinimapTracker:
                     if s != active_slug:
                         raw_scores[s] = max(0.0, raw_scores[active_slug] - 0.25)
             else:
+                mode_tag = "Neural-Top3"
                 neural_cands = [s for s, _p in neural_pred.top_slugs[:3] if s in self.dungeons]
                 if active_slug in self.dungeons and active_slug not in neural_cands:
                     neural_cands.append(active_slug)
@@ -811,6 +987,8 @@ class MinimapTracker:
                     raw_scores[s] = 0.72 * sc + 0.28 * float(prob_map.get(s, 0.0))
                     best_xy_by_slug[s] = xy
         else:
+            ran_cv = True
+            mode_tag = "Classic-CV"
             # Fast-path: if already confident in active_slug, check it first—but NEVER get stuck!
             # Always force a full map check every 5 frames (at 1 Hz = every 5s) or if score < 0.68.
             self._frame_count += 1
@@ -1040,7 +1218,7 @@ class MinimapTracker:
 
         # Motion-plausibility filter with 2-frame confirmation for real teleports / summons / revives
         max_step_px = plausible_yd * d.map_scale
-        if self._smooth_px is None:
+        if self._smooth_px is None or (mode_tag == "Anchor" and raw_scores.get(best_slug, 0.0) >= 0.58):
             self._smooth_px = raw_px
             self._jump_cand_px = None
             self._jump_confirm_count = 0
@@ -1085,7 +1263,15 @@ class MinimapTracker:
             self._last_outdoor_world_pos = np.array([world_x, world_y, world_z], dtype=np.float32)
 
         conf = float(np.clip((raw_scores[best_slug] - 0.15) / 0.65, 0.0, 1.0))
-        inference_ms = (time.perf_counter() - t0) * 1000.0
+        t_end = time.perf_counter()
+        inference_ms = (t_end - t0) * 1000.0
+        with self._lock:
+            self._total_ticks.append(t_end)
+            self.last_mode_tag = mode_tag
+            if ran_cv:
+                cv_ms = (t_end - t_cv_start) * 1000.0
+                self._cv_ticks.append(t_end)
+                self._cv_ms_ema = cv_ms if self._cv_ms_ema <= 0.0 else 0.25 * cv_ms + 0.75 * self._cv_ms_ema
         best_idx = order_snapshot.index(best_slug) if best_slug in order_snapshot else 0
 
         return TrackerEstimate(

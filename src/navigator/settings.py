@@ -111,7 +111,13 @@ class AppSettings:
     adaptive_ui_mask: bool = True
     high_precision: bool = False
     use_neural_model: bool = True
-    neural_model_name: str = ""      # "" = auto-select best available ONNX stem in data/models/
+    use_opencv_refine: bool = True
+    opencv_verify_only: bool = False  # True = run OpenCV only at verifier_hz; False = every frame
+    use_verifier_neural: bool = False  # True = run secondary Accurate AI verifier at verifier_hz
+    pipeline_preset: str = "hybrid_60hz_cv"
+    neural_max_hz: float = 0.0        # 0.0 = every frame (match poll), >0 = cap primary AI Hz
+    verifier_hz: float = 2.0          # 0.0 = off, else periodic verifier rate (strictly < AI Hz)
+    neural_model_name: str = ""       # "" = auto-select best available ONNX stem in data/models/
     periodic_opencv_anchor: bool = True
     storage_mode: str = "auto"       # "auto", "ssd", "hdd"
     wow_dir: str = ""

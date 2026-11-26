@@ -1,0 +1,1491 @@
+{
+  "backbone": "convnext_tiny.fb_in22k_ft_in1k",
+  "crop_size": 224,
+  "best_dr_acc": 0.9904,
+  "best_all_acc": 0.9143,
+  "class_map": {
+    "ahnqiraj_ruins": 0,
+    "ahnqiraj_temple": 1,
+    "blackfathom_deeps": 2,
+    "blackrock_depths": 3,
+    "blackrock_spire": 4,
+    "blackwing_lair": 5,
+    "deadmines": 6,
+    "dire_maul": 7,
+    "gnomeregan": 8,
+    "maraudon": 9,
+    "molten_core": 10,
+    "naxxramas": 11,
+    "onyxias_lair": 12,
+    "ragefire_chasm": 13,
+    "razorfen_downs": 14,
+    "razorfen_kraul": 15,
+    "ruins_of_lordaeron": 16,
+    "ruins_of_lordaeron_courtyard": 17,
+    "scarlet_monastery": 18,
+    "scholomance": 19,
+    "shadowfang_keep": 20,
+    "stockade": 21,
+    "stratholme": 22,
+    "sunken_temple": 23,
+    "uldaman": 24,
+    "wailing_caverns": 25,
+    "zul_farrak": 26,
+    "zul_gurub": 27,
+    "alterac_valley": 28,
+    "arathi_basin": 29,
+    "warsong_gulch": 30,
+    "darnassus": 31,
+    "ironforge": 32,
+    "orgrimmar": 33,
+    "stormwind_city": 34,
+    "thunder_bluff": 35,
+    "undercity": 36,
+    "alterac_mountains": 37,
+    "arathi_highlands": 38,
+    "ashenvale": 39,
+    "azshara": 40,
+    "badlands": 41,
+    "blasted_lands": 42,
+    "burning_steppes": 43,
+    "darkshore": 44,
+    "darkspear_islands": 45,
+    "deadwind_pass": 46,
+    "desolace": 47,
+    "dun_morogh": 48,
+    "durotar": 49,
+    "duskwood": 50,
+    "dustwallow_marsh": 51,
+    "eastern_plaguelands": 52,
+    "elwynn_forest": 53,
+    "felwood": 54,
+    "feralas": 55,
+    "hillsbrad_foothills": 56,
+    "loch_modan": 57,
+    "moonglade": 58,
+    "mount_hyjal": 59,
+    "mulgore": 60,
+    "redridge_mountains": 61,
+    "riverglades": 62,
+    "searing_gorge": 63,
+    "shen_dralas": 64,
+    "silithus": 65,
+    "silverpine_forest": 66,
+    "stonetalon_mountains": 67,
+    "stranglethorn_vale": 68,
+    "swamp_of_sorrows": 69,
+    "tanaris": 70,
+    "teldrassil": 71,
+    "the_barrens": 72,
+    "the_hinterlands": 73,
+    "thousand_needles": 74,
+    "tirisfal_glades": 75,
+    "un_goro_crater": 76,
+    "western_plaguelands": 77,
+    "westfall": 78,
+    "wetlands": 79,
+    "winterspring": 80,
+    "zephras_isle": 81
+  },
+  "maps": {
+    "ahnqiraj_ruins": {
+      "class_id": 0,
+      "name": "Ruins of Ahn'Qiraj (AQ20)",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.3199999928474426,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "ahnqiraj_temple": {
+      "class_id": 1,
+      "name": "Temple of Ahn'Qiraj (AQ40)",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.3840000033378601,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "blackfathom_deeps": {
+      "class_id": 2,
+      "name": "Blackfathom Deeps",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 2.6423990726470947,
+      "map_origin_xy": [
+        -87.35131072998047,
+        -229.69515991210938
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "blackrock_depths": {
+      "class_id": 3,
+      "name": "Blackrock Depths",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 5.672201156616211,
+      "map_origin_xy": [
+        -97.30632781982422,
+        -92.05925750732422
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "blackrock_spire": {
+      "class_id": 4,
+      "name": "Blackrock Spire (LBRS/UBRS)",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 1.7190101146697998,
+      "map_origin_xy": [
+        -569.3927001953125,
+        224.662109375
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "blackwing_lair": {
+      "class_id": 5,
+      "name": "Blackwing Lair",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.47999998927116394,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "deadmines": {
+      "class_id": 6,
+      "name": "The Deadmines",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 3.0540225505828857,
+      "map_origin_xy": [
+        -120.58708190917969,
+        -59.042572021484375
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "dire_maul": {
+      "class_id": 7,
+      "name": "Dire Maul",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.5194981694221497,
+      "map_origin_xy": [
+        -1255.579345703125,
+        -1041.61767578125
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "gnomeregan": {
+      "class_id": 8,
+      "name": "Gnomeregan",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 1.1514029502868652,
+      "map_origin_xy": [
+        173.2716064453125,
+        -714.495361328125
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "maraudon": {
+      "class_id": 9,
+      "name": "Maraudon",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.7204518914222717,
+      "map_origin_xy": [
+        -1214.1553955078125,
+        -451.594482421875
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "molten_core": {
+      "class_id": 10,
+      "name": "Molten Core",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.9686408638954163,
+      "map_origin_xy": [
+        -1440.03466796875,
+        234.5831298828125
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "naxxramas": {
+      "class_id": 11,
+      "name": "Naxxramas",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.3199999928474426,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "onyxias_lair": {
+      "class_id": 12,
+      "name": "Onyxia's Lair",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 2.900266647338867,
+      "map_origin_xy": [
+        -98.74198913574219,
+        -46.35926818847656
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "ragefire_chasm": {
+      "class_id": 13,
+      "name": "Ragefire Chasm",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 1.79680597782135,
+      "map_origin_xy": [
+        -128.284912109375,
+        -368.3893127441406
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "razorfen_downs": {
+      "class_id": 14,
+      "name": "Razorfen Downs",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "razorfen_kraul": {
+      "class_id": 15,
+      "name": "Razorfen Kraul",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.6399999856948853,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "ruins_of_lordaeron": {
+      "class_id": 16,
+      "name": "Ruins of Lordaeron / Undercity",
+      "category": "Cities",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 1.2367744445800781,
+      "map_origin_xy": [
+        -504.6116943359375,
+        -260.5389099121094
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "ruins_of_lordaeron_courtyard": {
+      "class_id": 17,
+      "name": "Ruins of Lordaeron (Courtyard)",
+      "category": "Battlegrounds",
+      "native_px_used": 512,
+      "map_size_px": 512,
+      "map_scale": 0.5851428508758545,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "scarlet_monastery": {
+      "class_id": 18,
+      "name": "Scarlet Monastery",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.47999998927116394,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "scholomance": {
+      "class_id": 19,
+      "name": "Scholomance",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.2133333384990692,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "shadowfang_keep": {
+      "class_id": 20,
+      "name": "Shadowfang Keep",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 3.2719454765319824,
+      "map_origin_xy": [
+        -247.67767333984375,
+        -158.2954864501953
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "stockade": {
+      "class_id": 21,
+      "name": "The Stockade",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 3.87872576713562,
+      "map_origin_xy": [
+        -102.5084228515625,
+        -213.67723083496094
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "stratholme": {
+      "class_id": 22,
+      "name": "Stratholme",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.3840000033378601,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "sunken_temple": {
+      "class_id": 23,
+      "name": "Sunken Temple",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 2.0028839111328125,
+      "map_origin_xy": [
+        221.211181640625,
+        -350.87469482421875
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "uldaman": {
+      "class_id": 24,
+      "name": "Uldaman",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 1.68356192111969,
+      "map_origin_xy": [
+        -210.53402709960938,
+        -502.402099609375
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "wailing_caverns": {
+      "class_id": 25,
+      "name": "Wailing Caverns",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 2.115128755569458,
+      "map_origin_xy": [
+        -18.401382446289062,
+        -360.6080322265625
+      ],
+      "map_rot90": 3,
+      "bounds_xy": null
+    },
+    "zul_farrak": {
+      "class_id": 26,
+      "name": "Zul'Farrak",
+      "category": "Dungeons",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.2742857038974762,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "zul_gurub": {
+      "class_id": 27,
+      "name": "Zul'Gurub",
+      "category": "Raids",
+      "native_px_used": 1024,
+      "map_size_px": 1024,
+      "map_scale": 0.3840000033378601,
+      "map_origin_xy": [
+        0.0,
+        0.0
+      ],
+      "map_rot90": 0,
+      "bounds_xy": null
+    },
+    "alterac_valley": {
+      "class_id": 28,
+      "name": "Alterac Valley",
+      "category": "Battlegrounds",
+      "native_px_used": 4068,
+      "map_size_px": 4068,
+      "map_scale": 0.9600226283073425,
+      "map_origin_xy": [
+        -2445.800048828125,
+        -2456.199951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -1739.5999755859375,
+        -2456.199951171875,
+        1085.4000244140625,
+        1781.199951171875
+      ]
+    },
+    "arathi_basin": {
+      "class_id": 29,
+      "name": "Arathi Basin",
+      "category": "Battlegrounds",
+      "native_px_used": 1686,
+      "map_size_px": 1686,
+      "map_scale": 0.9600273370742798,
+      "map_origin_xy": [
+        44.79999923706055,
+        102.0999984741211
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        337.5,
+        102.0999984741211,
+        1508.300048828125,
+        1858.300048828125
+      ]
+    },
+    "warsong_gulch": {
+      "class_id": 30,
+      "name": "Warsong Gulch",
+      "category": "Battlegrounds",
+      "native_px_used": 1100,
+      "map_size_px": 1100,
+      "map_scale": 0.9599441289901733,
+      "map_origin_xy": [
+        671.8499755859375,
+        895.7999877929688
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        862.5,
+        895.7999877929688,
+        1627.0999755859375,
+        2041.699951171875
+      ]
+    },
+    "darnassus": {
+      "class_id": 31,
+      "name": "Darnassus",
+      "category": "Cities",
+      "native_px_used": 1016,
+      "map_size_px": 1016,
+      "map_scale": 0.9599395394325256,
+      "map_origin_xy": [
+        9356.25,
+        1880.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        9532.599609375,
+        1880.0,
+        10238.2998046875,
+        2938.39990234375
+      ]
+    },
+    "ironforge": {
+      "class_id": 32,
+      "name": "Ironforge",
+      "category": "Cities",
+      "native_px_used": 759,
+      "map_size_px": 759,
+      "map_scale": 0.9600303769111633,
+      "map_origin_xy": [
+        -5228.2998046875,
+        -1504.199951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -5096.7998046875,
+        -1504.199951171875,
+        -4569.2001953125,
+        -713.5999755859375
+      ]
+    },
+    "orgrimmar": {
+      "class_id": 33,
+      "name": "Orgrimmar",
+      "category": "Cities",
+      "native_px_used": 1346,
+      "map_size_px": 1346,
+      "map_scale": 0.9596463441848755,
+      "map_origin_xy": [
+        1104.9000244140625,
+        -5083.2001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        1338.5,
+        -5083.2001953125,
+        2273.89990234375,
+        -3680.60009765625
+      ]
+    },
+    "stormwind_city": {
+      "class_id": 34,
+      "name": "Stormwind City",
+      "category": "Cities",
+      "native_px_used": 1668,
+      "map_size_px": 1668,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -9443.75,
+        -14.600000381469727
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -9154.2001953125,
+        -14.600000381469727,
+        -7995.7998046875,
+        1722.9000244140625
+      ]
+    },
+    "thunder_bluff": {
+      "class_id": 35,
+      "name": "Thunder Bluff",
+      "category": "Cities",
+      "native_px_used": 1002,
+      "map_size_px": 1002,
+      "map_scale": 0.959954023361206,
+      "map_origin_xy": [
+        -1719.800048828125,
+        -527.0999755859375
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -1545.800048828125,
+        -527.0999755859375,
+        -850.0,
+        516.7000122070312
+      ]
+    },
+    "undercity": {
+      "class_id": 36,
+      "name": "Undercity",
+      "category": "Cities",
+      "native_px_used": 921,
+      "map_size_px": 921,
+      "map_scale": 0.959975004196167,
+      "map_origin_xy": [
+        1078.1500244140625,
+        -86.19999694824219
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        1237.800048828125,
+        -86.19999694824219,
+        1877.9000244140625,
+        873.2000122070312
+      ]
+    },
+    "alterac_mountains": {
+      "class_id": 37,
+      "name": "Alterac Mountains",
+      "category": "Zones",
+      "native_px_used": 2688,
+      "map_size_px": 2688,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -833.3499755859375,
+        -2016.699951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -366.70001220703125,
+        -2016.699951171875,
+        1500.0,
+        783.2999877929688
+      ]
+    },
+    "arathi_highlands": {
+      "class_id": 38,
+      "name": "Arathi Highlands",
+      "category": "Zones",
+      "native_px_used": 3456,
+      "map_size_px": 3456,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -3133.300048828125,
+        -4466.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -2533.300048828125,
+        -4466.7001953125,
+        -133.3000030517578,
+        -866.7000122070312
+      ]
+    },
+    "ashenvale": {
+      "class_id": 39,
+      "name": "Ashenvale",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 5536,
+      "map_scale": 0.9599944353103638,
+      "map_origin_xy": [
+        -132.3000030517578,
+        -4066.699951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        829.2000122070312,
+        -4066.699951171875,
+        4672.89990234375,
+        1700.0
+      ]
+    },
+    "azshara": {
+      "class_id": 40,
+      "name": "Azshara",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4868,
+      "map_scale": 0.9600062966346741,
+      "map_origin_xy": [
+        1115.6500244140625,
+        -8347.900390625
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        1960.4000244140625,
+        -8347.900390625,
+        5341.7001953125,
+        -3277.10009765625
+      ]
+    },
+    "badlands": {
+      "class_id": 41,
+      "name": "Badlands",
+      "category": "Zones",
+      "native_px_used": 2388,
+      "map_size_px": 2388,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -7962.5,
+        -4566.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -7547.89990234375,
+        -4566.7001953125,
+        -5889.60009765625,
+        -2079.199951171875
+      ]
+    },
+    "blasted_lands": {
+      "class_id": 42,
+      "name": "Blasted Lands",
+      "category": "Zones",
+      "native_px_used": 3216,
+      "map_size_px": 3216,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -13358.349609375,
+        -4591.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -12800.0,
+        -4591.7001953125,
+        -10566.7001953125,
+        -1241.699951171875
+      ]
+    },
+    "burning_steppes": {
+      "class_id": 43,
+      "name": "Burning Steppes",
+      "category": "Zones",
+      "native_px_used": 2812,
+      "map_size_px": 2812,
+      "map_scale": 0.9600218534469604,
+      "map_origin_xy": [
+        -9471.7998046875,
+        -3195.800048828125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -8983.2998046875,
+        -3195.800048828125,
+        -7031.2001953125,
+        -266.70001220703125
+      ]
+    },
+    "darkshore": {
+      "class_id": 44,
+      "name": "Darkshore",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 6288,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        2875.0,
+        -3608.300048828125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        3966.699951171875,
+        -3608.300048828125,
+        8333.2998046875,
+        2941.699951171875
+      ]
+    },
+    "darkspear_islands": {
+      "class_id": 45,
+      "name": "Darkspear Islands",
+      "category": "Zones",
+      "native_px_used": 1848,
+      "map_size_px": 1848,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -1156.25,
+        993.7999877929688
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -835.4000244140625,
+        993.7999877929688,
+        447.8999938964844,
+        2918.800048828125
+      ]
+    },
+    "deadwind_pass": {
+      "class_id": 46,
+      "name": "Deadwind Pass",
+      "category": "Zones",
+      "native_px_used": 2400,
+      "map_size_px": 2400,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -11950.0,
+        -3333.300048828125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -11533.2998046875,
+        -3333.300048828125,
+        -9866.7001953125,
+        -833.2999877929688
+      ]
+    },
+    "desolace": {
+      "class_id": 47,
+      "name": "Desolace",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4316,
+      "map_scale": 0.9600071310997009,
+      "map_origin_xy": [
+        -3294.75,
+        -262.5
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -2545.800048828125,
+        -262.5,
+        452.1000061035156,
+        4233.2998046875
+      ]
+    },
+    "dun_morogh": {
+      "class_id": 48,
+      "name": "Dun Morogh",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4728,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -7981.25,
+        -3122.89990234375
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -7160.39990234375,
+        -3122.89990234375,
+        -3877.10009765625,
+        1802.0999755859375
+      ]
+    },
+    "durotar": {
+      "class_id": 49,
+      "name": "Durotar",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 5076,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -2597.949951171875,
+        -7250.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -1716.699951171875,
+        -7250.0,
+        1808.300048828125,
+        -1962.5
+      ]
+    },
+    "duskwood": {
+      "class_id": 50,
+      "name": "Duskwood",
+      "category": "Zones",
+      "native_px_used": 2592,
+      "map_size_px": 2592,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -11966.7001953125,
+        -1866.699951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -11516.7001953125,
+        -1866.699951171875,
+        -9716.7001953125,
+        833.2999877929688
+      ]
+    },
+    "dustwallow_marsh": {
+      "class_id": 51,
+      "name": "Dustwallow Marsh",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 5040,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -6408.2998046875,
+        -6225.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -5533.2998046875,
+        -6225.0,
+        -2033.300048828125,
+        -975.0
+      ]
+    },
+    "eastern_plaguelands": {
+      "class_id": 52,
+      "name": "Eastern Plaguelands",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4130,
+      "map_scale": 0.9599962830543518,
+      "map_origin_xy": [
+        107.30000305175781,
+        -6558.2998046875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        825.0,
+        -6558.2998046875,
+        3691.699951171875,
+        -2256.199951171875
+      ]
+    },
+    "elwynn_forest": {
+      "class_id": 53,
+      "name": "Elwynn Forest",
+      "category": "Zones",
+      "native_px_used": 3332,
+      "map_size_px": 3332,
+      "map_scale": 0.9600092172622681,
+      "map_origin_xy": [
+        -10832.2998046875,
+        -1935.4000244140625
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -10254.2001953125,
+        -1935.4000244140625,
+        -7939.60009765625,
+        1535.4000244140625
+      ]
+    },
+    "felwood": {
+      "class_id": 54,
+      "name": "Felwood",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 5520,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        2341.64990234375,
+        -4108.2998046875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        3300.0,
+        -4108.2998046875,
+        7133.2998046875,
+        1641.699951171875
+      ]
+    },
+    "feralas": {
+      "class_id": 55,
+      "name": "Feralas",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 6672,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -8158.35009765625,
+        -1508.300048828125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -7000.0,
+        -1508.300048828125,
+        -2366.699951171875,
+        5441.7001953125
+      ]
+    },
+    "hillsbrad_foothills": {
+      "class_id": 56,
+      "name": "Hillsbrad Foothills",
+      "category": "Zones",
+      "native_px_used": 3072,
+      "map_size_px": 3072,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -2266.64990234375,
+        -2133.300048828125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -1733.300048828125,
+        -2133.300048828125,
+        400.0,
+        1066.699951171875
+      ]
+    },
+    "loch_modan": {
+      "class_id": 57,
+      "name": "Loch Modan",
+      "category": "Zones",
+      "native_px_used": 2648,
+      "map_size_px": 2648,
+      "map_scale": 0.9599767923355103,
+      "map_origin_xy": [
+        -6786.5,
+        -4752.10009765625
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -6327.10009765625,
+        -4752.10009765625,
+        -4487.5,
+        -1993.699951171875
+      ]
+    },
+    "moonglade": {
+      "class_id": 58,
+      "name": "Moonglade",
+      "category": "Zones",
+      "native_px_used": 2216,
+      "map_size_px": 2216,
+      "map_scale": 0.9599722623825073,
+      "map_origin_xy": [
+        6567.7001953125,
+        -3689.60009765625
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        6952.10009765625,
+        -3689.60009765625,
+        8491.7001953125,
+        -1381.199951171875
+      ]
+    },
+    "mount_hyjal": {
+      "class_id": 59,
+      "name": "Mount Hyjal",
+      "category": "Zones",
+      "native_px_used": 3334,
+      "map_size_px": 3334,
+      "map_scale": 0.9600046277046204,
+      "map_origin_xy": [
+        3410.449951171875,
+        -4395.7998046875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        3989.60009765625,
+        -4395.7998046875,
+        6304.2001953125,
+        -922.9000244140625
+      ]
+    },
+    "mulgore": {
+      "class_id": 60,
+      "name": "Mulgore",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 5908,
+      "map_scale": 0.9599947929382324,
+      "map_origin_xy": [
+        -4861.4501953125,
+        -3675.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -3835.39990234375,
+        -3675.0,
+        266.70001220703125,
+        2479.199951171875
+      ]
+    },
+    "redridge_mountains": {
+      "class_id": 61,
+      "name": "Redridge Mountains",
+      "category": "Zones",
+      "native_px_used": 2084,
+      "map_size_px": 2084,
+      "map_scale": 0.9599705338478088,
+      "map_origin_xy": [
+        -10384.400390625,
+        -3852.10009765625
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -10022.900390625,
+        -3852.10009765625,
+        -8575.0,
+        -1681.199951171875
+      ]
+    },
+    "riverglades": {
+      "class_id": 62,
+      "name": "Riverglades",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4656,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -10508.349609375,
+        -6741.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -9700.0,
+        -6741.7001953125,
+        -6466.7001953125,
+        -1891.699951171875
+      ]
+    },
+    "searing_gorge": {
+      "class_id": 63,
+      "name": "Searing Gorge",
+      "category": "Zones",
+      "native_px_used": 2142,
+      "map_size_px": 2142,
+      "map_scale": 0.959978461265564,
+      "map_origin_xy": [
+        -7959.39990234375,
+        -2554.199951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -7587.5,
+        -2554.199951171875,
+        -6100.0,
+        -322.8999938964844
+      ]
+    },
+    "shen_dralas": {
+      "class_id": 64,
+      "name": "Shen'dralas",
+      "category": "Zones",
+      "native_px_used": 1968,
+      "map_size_px": 1968,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -3608.35009765625,
+        -25.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -3266.699951171875,
+        -25.0,
+        -1900.0,
+        2025.0
+      ]
+    },
+    "silithus": {
+      "class_id": 65,
+      "name": "Silithus",
+      "category": "Zones",
+      "native_px_used": 3344,
+      "map_size_px": 3344,
+      "map_scale": 0.9600091576576233,
+      "map_origin_xy": [
+        -8861.400390625,
+        -945.7999877929688
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -8281.2001953125,
+        -945.7999877929688,
+        -5958.2998046875,
+        2537.5
+      ]
+    },
+    "silverpine_forest": {
+      "class_id": 66,
+      "name": "Silverpine Forest",
+      "category": "Zones",
+      "native_px_used": 4032,
+      "map_size_px": 4032,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -1833.300048828125,
+        -750.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -1133.300048828125,
+        -750.0,
+        1666.699951171875,
+        3450.0
+      ]
+    },
+    "stonetalon_mountains": {
+      "class_id": 67,
+      "name": "Stonetalon Mountains",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4688,
+      "map_scale": 0.9600065350532532,
+      "map_origin_xy": [
+        -1153.0999755859375,
+        -1637.5
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -339.6000061035156,
+        -1637.5,
+        2916.699951171875,
+        3245.800048828125
+      ]
+    },
+    "stranglethorn_vale": {
+      "class_id": 68,
+      "name": "Stranglethorn Vale",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 6126,
+      "map_scale": 0.9600075483322144,
+      "map_origin_xy": [
+        -16486.44921875,
+        -4160.39990234375
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -15422.900390625,
+        -4160.39990234375,
+        -11168.7998046875,
+        2220.800048828125
+      ]
+    },
+    "swamp_of_sorrows": {
+      "class_id": 69,
+      "name": "Swamp of Sorrows",
+      "category": "Zones",
+      "native_px_used": 2202,
+      "map_size_px": 2202,
+      "map_scale": 0.9599790573120117,
+      "map_origin_xy": [
+        -11532.2998046875,
+        -4516.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -11150.0,
+        -4516.7001953125,
+        -9620.7998046875,
+        -2222.89990234375
+      ]
+    },
+    "tanaris": {
+      "class_id": 70,
+      "name": "Tanaris",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 6624,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -11625.0,
+        -7118.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -10475.0,
+        -7118.7001953125,
+        -5875.0,
+        -218.6999969482422
+      ]
+    },
+    "the_barrens": {
+      "class_id": 72,
+      "name": "The Barrens",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4096,
+      "map_scale": 0.4042118489742279,
+      "map_origin_xy": [
+        -6832.2998046875,
+        -7510.39990234375
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -5143.7998046875,
+        -7510.39990234375,
+        1612.5,
+        2622.89990234375
+      ]
+    },
+    "the_hinterlands": {
+      "class_id": 73,
+      "name": "The Hinterlands",
+      "category": "Zones",
+      "native_px_used": 3696,
+      "map_size_px": 3696,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -1741.6500244140625,
+        -5425.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -1100.0,
+        -5425.0,
+        1466.699951171875,
+        -1575.0
+      ]
+    },
+    "thousand_needles": {
+      "class_id": 74,
+      "name": "Thousand Needles",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4224,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -7633.35009765625,
+        -4833.2998046875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -6900.0,
+        -4833.2998046875,
+        -3966.699951171875,
+        -433.29998779296875
+      ]
+    },
+    "tirisfal_glades": {
+      "class_id": 75,
+      "name": "Tirisfal Glades",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4338,
+      "map_scale": 0.9600106477737427,
+      "map_origin_xy": [
+        71.9000015258789,
+        -1485.4000244140625
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        825.0,
+        -1485.4000244140625,
+        3837.5,
+        3033.300048828125
+      ]
+    },
+    "un_goro_crater": {
+      "class_id": 76,
+      "name": "Un'Goro Crater",
+      "category": "Zones",
+      "native_px_used": 3552,
+      "map_size_px": 3552,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -9050.0,
+        -3166.699951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -8433.2998046875,
+        -3166.699951171875,
+        -5966.7001953125,
+        533.2999877929688
+      ]
+    },
+    "western_plaguelands": {
+      "class_id": 77,
+      "name": "Western Plaguelands",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 4128,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -216.64999389648438,
+        -3883.300048828125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        500.0,
+        -3883.300048828125,
+        3366.699951171875,
+        416.70001220703125
+      ]
+    },
+    "westfall": {
+      "class_id": 78,
+      "name": "Westfall",
+      "category": "Zones",
+      "native_px_used": 3360,
+      "map_size_px": 3360,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        -12316.650390625,
+        -483.29998779296875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -11733.2998046875,
+        -483.29998779296875,
+        -9400.0,
+        3016.699951171875
+      ]
+    },
+    "wetlands": {
+      "class_id": 79,
+      "name": "Wetlands",
+      "category": "Zones",
+      "native_px_used": 3970,
+      "map_size_px": 3970,
+      "map_scale": 0.9600038528442383,
+      "map_origin_xy": [
+        -5593.75,
+        -4525.0
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        -4904.2001953125,
+        -4525.0,
+        -2147.89990234375,
+        -389.6000061035156
+      ]
+    },
+    "winterspring": {
+      "class_id": 80,
+      "name": "Winterspring",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 6816,
+      "map_scale": 0.9599999785423279,
+      "map_origin_xy": [
+        2616.64990234375,
+        -7416.7001953125
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        3800.0,
+        -7416.7001953125,
+        8533.2998046875,
+        -316.70001220703125
+      ]
+    },
+    "zephras_isle": {
+      "class_id": 81,
+      "name": "Zephras Isle",
+      "category": "Zones",
+      "native_px_used": 4096,
+      "map_size_px": 5340,
+      "map_scale": 0.9600172638893127,
+      "map_origin_xy": [
+        320.8500061035156,
+        -1331.199951171875
+      ],
+      "map_rot90": 1,
+      "bounds_xy": [
+        1247.9000244140625,
+        -1331.199951171875,
+        4956.2001953125,
+        4231.2001953125
+      ]
+    }
+  }
+}
