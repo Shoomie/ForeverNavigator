@@ -96,7 +96,7 @@ def resolve_storage_mode(storage_mode: str, path: str | Path = ".") -> str:
 
 @dataclass
 class AppSettings:
-    fps: float = 1.0
+    fps: float = 5.0
     monitor: int = 1
     mode: str = "Minimap (2D Ultra-Light)"
     follow_player: bool = True

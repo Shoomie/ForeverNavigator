@@ -1719,7 +1719,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
         opt_pipe = QHBoxLayout()
         opt_pipe.addWidget(QLabel("Pipeline:"))
         self._pipeline_presets = [
-            ("Hybrid (AI + 60Hz ImgRec)", "hybrid_60hz_cv"),
+            ("Hybrid (AI + ImgRec)", "hybrid_60hz_cv"),
             ("Accurate AI + Classic Ver", "accurate_plus_classic"),
             ("Fast v2 + Accurate AI Ver", "fast_plus_accurate"),
             ("Fast v2 + Acc AI + Classic", "fast_plus_accurate_classic"),
@@ -1729,7 +1729,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self._pipe_key_to_label = {key: lbl for lbl, key in self._pipeline_presets}
         self.cb_pipeline = QComboBox()
         self.cb_pipeline.addItems([lbl for lbl, _ in self._pipeline_presets])
-        self.cb_pipeline.setCurrentText(self._pipe_key_to_label.get(self.settings.pipeline_preset, "Hybrid (AI + 60Hz ImgRec)"))
+        self.cb_pipeline.setCurrentText(self._pipe_key_to_label.get(self.settings.pipeline_preset, "Hybrid (AI + ImgRec)"))
         self.cb_pipeline.setToolTip("One-click tracking & verification architecture preset")
         self.cb_pipeline.currentTextChanged.connect(self._on_pipeline_preset_change)
         opt_pipe.addWidget(self.cb_pipeline, 1)
@@ -2366,13 +2366,15 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.lbl_stats.setText(f"Storage streaming: {self._effective_storage_mode.upper()} mode")
 
     def _on_fps_change(self, lbl: str) -> None:
-        val = float(self._fps_label_to_val.get(lbl, 1.0))
+        val = float(self._fps_label_to_val.get(lbl, 5.0))
         self.fps = val
         self.settings.fps = val
         save_settings(self.settings_path, self.settings)
         self.pill_fps.setText(f"{val:.0f} Hz" if val >= 5.0 else f"{val:.1f} Hz")
-        if self.running:
-            self._poll_timer.start(max(16, int(round(1000.0 / max(1.0, val)))))
+        # Keep the visual glide timer at 60 FPS (16ms) regardless of capture polling Hz
+        # so 5 Hz polling still glides smoothly in the viewport!
+        if self.running and not self._poll_timer.isActive():
+            self._poll_timer.start(16)
         self.lbl_stats.setText(f"Tracking polling rate: {lbl}")
 
     def _toggle_neural_model(self, enabled: bool) -> None:
@@ -2439,11 +2441,12 @@ class ForeverNavigatorQtWindow(QMainWindow):
             self.settings.opencv_verify_only = True
             self.settings.use_verifier_neural = False
             self.settings.neural_max_hz = 0.0
-        else:  # hybrid_60hz_cv
+        else:  # hybrid_60hz_cv (Hybrid AI + ImgRec, synced)
             self.settings.use_neural_model = True
             self.settings.use_opencv_refine = True
             self.settings.opencv_verify_only = False
             self.settings.use_verifier_neural = False
+            self.settings.neural_max_hz = 0.0
 
         # Apply to tracker & sync checkboxes without re-triggering cascade
         self.tracker_mm.set_use_neural(self.settings.use_neural_model)
@@ -2815,40 +2818,68 @@ class ForeverNavigatorQtWindow(QMainWindow):
             self.pill_pos.setText(f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%")
             self.lbl_dungeon.setText(f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]")
 
-        # Sub-pixel 60 FPS visual interpolation toward the latest tracker position (eliminates visual judder!)
+        # Time-based 60 FPS visual glide toward the latest tracker position.
+        # Adapts the glide time constant to the polling rate (e.g. tau=0.15s at 5 Hz) so
+        # both the player marker and follow-camera map shift softly with zero lurch-pause!
+        last_vis_t = getattr(self, "_last_vis_t", 0.0)
+        vis_dt = max(0.001, min(0.10, now_ui - last_vis_t)) if last_vis_t > 0.0 else 0.016
+        self._last_vis_t = now_ui
+
         target_px = getattr(self.tracker_mm, "last_smooth_px", None) or (float(est.map_px[0]), float(est.map_px[1]))
         prev_slug = getattr(self, "_render_px_slug", None)
         cur_rpx = getattr(self, "_render_px", None)
         moved_vis = False
+        snapped = False
         if cur_rpx is None or prev_slug != est.dungeon_slug:
             self._render_px = (float(target_px[0]), float(target_px[1]))
             self._render_px_slug = est.dungeon_slug
             moved_vis = True
+            snapped = True
         else:
             dx = float(target_px[0]) - cur_rpx[0]
             dy = float(target_px[1]) - cur_rpx[1]
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist > 45.0:
+            dist = math.hypot(dx, dy)
+            if dist > 140.0:
                 self._render_px = (float(target_px[0]), float(target_px[1]))
                 moved_vis = True
-            elif dist > 0.04:
-                alpha = 0.35
+                snapped = True
+            elif dist > 0.03:
+                tau = max(0.045, min(0.24, 0.75 / max(1.0, self.fps)))
+                alpha = 1.0 - math.exp(-vis_dt / tau)
                 self._render_px = (cur_rpx[0] + dx * alpha, cur_rpx[1] + dy * alpha)
                 moved_vis = True
 
+        pan_needs_glide = (
+            self.chk_follow.isChecked()
+            and self._render_px is not None
+            and math.hypot(self._render_px[0] - self.pan_x, self._render_px[1] - self.pan_y) > 0.03
+        )
         if self._showing_azeroth_overview and self._transition_state is None:
             if is_new_est:
                 self._maybe_autoload_neural_zone()
                 if self._is_good_position_fix(est):
                     self._start_fix_transition(est)
-        elif self._transition_state is None and (is_new_est or moved_vis):
+        elif self._transition_state is None and (is_new_est or moved_vis or pan_needs_glide):
             if self.chk_follow.isChecked() and self._render_px is not None:
-                self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
+                if snapped:
+                    self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
+                else:
+                    pdx = self._render_px[0] - self.pan_x
+                    pdy = self._render_px[1] - self.pan_y
+                    pdist = math.hypot(pdx, pdy)
+                    if pdist > 140.0:
+                        self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
+                    elif pdist > 0.03:
+                        pan_tau = max(0.06, min(0.26, 0.85 / max(1.0, self.fps)))
+                        pan_alpha = 1.0 - math.exp(-vis_dt / pan_tau)
+                        self.pan_x += pdx * pan_alpha
+                        self.pan_y += pdy * pan_alpha
+                        moved_vis = True
             if is_new_est:
                 self._maybe_autoload_neural_zone()
                 self._maybe_stream_nearby_zones(est)
             if self.view_3d_mode:
-                if is_new_est:
+                if is_new_est or moved_vis:
                     self._render_3d_frame()
             else:
                 self.viewport.update()

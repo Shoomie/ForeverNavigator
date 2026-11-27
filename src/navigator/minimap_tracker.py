@@ -891,7 +891,7 @@ class MinimapTracker:
                     prev_work_xy=None, plausible_radius_work=None,
                     tpl_cache=tpl_cache,
                 )
-                if sc_full > sc + 0.10:
+                if sc_full >= 0.56 and sc_full > sc + 0.14:
                     sc, xy = sc_full, xy_full
             # If locked-scale match dipped, immediately fall back to full multi-scale check
             if use_locked_scale and sc < 0.52:
@@ -921,6 +921,7 @@ class MinimapTracker:
             active_slug = self.active_slug
 
         raw_scores: Dict[str, float] = {s: 0.0 for s in order}
+        raw_cv_scores: Dict[str, float] = {}
         best_xy_by_slug: Dict[str, Tuple[float, float]] = {}
         t_cv_start = time.perf_counter()
         ran_cv = False
@@ -950,6 +951,7 @@ class MinimapTracker:
             mode_tag = "Locked-CV"
             sc, xy = eval_fine(locked_slug)
             raw_scores[locked_slug] = sc
+            raw_cv_scores[locked_slug] = sc
             best_xy_by_slug[locked_slug] = xy
         elif (
             neural_pred is not None
@@ -985,6 +987,7 @@ class MinimapTracker:
                     mode_tag = "Fast-Lock"
                     sc_a, xy_a = eval_fine(active_slug)
                 raw_scores[active_slug] = 0.72 * sc_a + 0.28 * float(neural_pred.best_prob)
+                raw_cv_scores[active_slug] = sc_a
                 best_xy_by_slug[active_slug] = xy_a
                 for s in order:
                     if s != active_slug:
@@ -997,6 +1000,7 @@ class MinimapTracker:
                 for s in neural_cands:
                     sc, xy = eval_fine(s)
                     raw_scores[s] = 0.72 * sc + 0.28 * float(prob_map.get(s, 0.0))
+                    raw_cv_scores[s] = sc
                     best_xy_by_slug[s] = xy
         else:
             ran_cv = True
@@ -1233,9 +1237,19 @@ class MinimapTracker:
         ):
             raw_px = self._refine_full_res(d, inner_sq, raw_px, zoom_radii_yd, angles_deg)
 
-        # Motion-plausibility filter with 2-frame confirmation for real teleports / summons / revives
+        # Motion-plausibility filter with 2-frame high-confidence confirmation for real teleports / summons / revives.
+        # Guard against weak OpenCV noise peaks (e.g. featureless forest/water in Azshara) triggering false 200px snaps:
+        # - Anchor only bypasses the filter when pure OpenCV match score is unmistakable (>= 0.72), not merely
+        #   boosted by the zone classifier's neural_prob!
+        # - Implausible jumps (> max_step_px) require both 2 consecutive consistent frames AND strong match confidence.
         max_step_px = plausible_yd * d.map_scale
-        if self._smooth_px is None or (mode_tag == "Anchor" and raw_scores.get(best_slug, 0.0) >= 0.58):
+        cv_score_best = raw_cv_scores.get(best_slug)
+        strong_cv_lock = (cv_score_best is not None and cv_score_best >= 0.72)
+        jump_match_ok = (
+            (cv_score_best is not None and cv_score_best >= 0.62)
+            or (cv_score_best is None and raw_scores.get(best_slug, 0.0) >= 0.72)
+        )
+        if self._smooth_px is None or (mode_tag == "Anchor" and strong_cv_lock):
             self._smooth_px = raw_px
             self._jump_cand_px = None
             self._jump_confirm_count = 0
@@ -1243,11 +1257,15 @@ class MinimapTracker:
             step_px = float(np.linalg.norm(raw_px - self._smooth_px))
             if step_px <= max_step_px:
                 # Normal plausible movement (walking / running / sprinting / mounted)
-                self._smooth_px = 0.65 * raw_px + 0.35 * self._smooth_px
+                # Hold position if OpenCV match is very weak (< 0.34) to prevent random drift in featureless terrain
+                if cv_score_best is not None and cv_score_best < 0.34:
+                    pass
+                else:
+                    self._smooth_px = 0.65 * raw_px + 0.35 * self._smooth_px
                 self._jump_cand_px = None
                 self._jump_confirm_count = 0
-            else:
-                # Implausibly large jump: require 2 consecutive consistent frames before snapping
+            elif jump_match_ok:
+                # Implausibly large jump with strong match confidence: require 2 consecutive consistent frames
                 # (rejects 1-frame minimap glitches while still supporting summons/teleports/revives!)
                 confirm_tol_px = max(25.0, 28.0 * d.map_scale)
                 if self._jump_cand_px is not None and float(np.linalg.norm(raw_px - self._jump_cand_px)) <= confirm_tol_px:
@@ -1264,6 +1282,10 @@ class MinimapTracker:
                     self._jump_confirm_count = 0
                     self.trail_px.clear()
                 # else: hold previous smooth_px for 1 frame until confirmed
+            else:
+                # Weak-confidence implausible jump (e.g. featureless terrain / false full-map peak) -> ignore & hold
+                self._jump_cand_px = None
+                self._jump_confirm_count = 0
 
         self.last_smooth_px = (float(self._smooth_px[0]), float(self._smooth_px[1]))
         px_i, py_i = int(round(float(self._smooth_px[0]))), int(round(float(self._smooth_px[1])))

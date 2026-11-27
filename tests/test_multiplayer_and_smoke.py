@@ -330,7 +330,7 @@ class TestSubsystemSmoke(unittest.TestCase):
             p = Path(td) / "settings.json"
             p.write_text("{corrupt json", encoding="utf-8")
             s = load_settings(p)
-            self.assertEqual(s.fps, 1.0)
+            self.assertEqual(s.fps, 5.0)
             s.fps = 99.0
             save_settings(p, s)
             s2 = load_settings(p)
