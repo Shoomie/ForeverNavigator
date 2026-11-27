@@ -845,16 +845,25 @@ class MinimapTracker:
             d = self.dungeons[slug]
             ratio = self._scale_ratio[slug]
             w_sz = self._map_sil[slug].shape[0]
-            # Fast locked-scale path: once zoom is known on active_slug, test only the locked scale
-            # (cuts local OpenCV from ~15 ms -> ~2.5 ms for true 60 Hz), re-checking all scales every 1.5s.
+            # Fast locked-scale path: once zoom is known on active_slug, stay on the locked scale
+            # (~20-30 ms) as long as match confidence stays healthy (>= 0.52). If the user zooms
+            # their minimap or switches zones, sc < 0.52 or zone-switch immediately triggers a
+            # full multi-scale re-lock — eliminating periodic 600ms multi-scale stalls every 1.5s!
             use_locked_scale = (
                 not force_full_map
                 and slug == self.active_slug
                 and self._smooth_px is not None
                 and self._locked_zoom_yd is not None
-                and (now_t - self._last_zoom_check_t) < 1.5
             )
-            radii_to_try = (self._locked_zoom_yd,) if use_locked_scale else zoom_radii_yd
+            # Outdoor/city minimaps in WoW never zoom tighter than ~85-100 yd; testing tiny dungeon
+            # scales (32-62 yd) on outdoor/city maps causes 29x29px patches to hallucinate higher
+            # correlation on random cliffs than the true 155yd city match!
+            slug_radii = (
+                tuple(r for r in zoom_radii_yd if r >= 85.0)
+                if self._is_outdoor_zone.get(slug, False)
+                else zoom_radii_yd
+            ) or zoom_radii_yd
+            radii_to_try = (self._locked_zoom_yd,) if (use_locked_scale and self._locked_zoom_yd in slug_radii) else slug_radii
             raw_scales = [
                 min(w_sz - 8, int(round(2.0 * float(r_yd) * 0.62 * d.map_scale / ratio)))
                 for r_yd in radii_to_try
@@ -876,9 +885,14 @@ class MinimapTracker:
                 prev_work_xy=prev_wxy, plausible_radius_work=plaus_w,
                 tpl_cache=tpl_cache,
             )
-            # If the previous frame proposed a high-confidence jump/re-acquisition candidate,
-            # also check a tight local window around that candidate so 2-frame confirmation
-            # never deadlocks against the 1.5s full-map re-acquisition throttle!
+            # If locked-scale match dipped significantly (< 0.40, e.g. user changed minimap zoom),
+            # immediately unlock and re-evaluate with all valid zoom scales BEFORE full-map re-acq.
+            if use_locked_scale and sc < 0.40:
+                self._locked_zoom_yd = None
+                return eval_fine(slug, force_full_map=False)
+            # If the previous frame proposed a jump/re-acquisition candidate, also check a tight local
+            # window around that candidate so multi-frame confirmation never deadlocks against the
+            # 1.5s full-map re-acquisition throttle!
             if (
                 not force_full_map
                 and slug == self.active_slug
@@ -886,40 +900,50 @@ class MinimapTracker:
                 and prev_wxy is not None
             ):
                 cand_wxy = (float(self._jump_cand_px[0]) / ratio, float(self._jump_cand_px[1]) / ratio)
-                cand_plaus_w = max(plaus_w or 12.0, (35.0 * d.map_scale) / ratio)
+                cand_plaus_w = max(plaus_w or 12.0, (38.0 * d.map_scale) / ratio)
                 sc_cand, xy_cand = self._match_single_dungeon(
                     slug, crop_sil, crop_edge, scales_px, angles_deg,
                     prev_work_xy=cand_wxy, plausible_radius_work=cand_plaus_w,
                     tpl_cache=tpl_cache,
                 )
-                if sc_cand >= 0.56 and sc_cand > sc + 0.08:
+                if sc_cand >= 0.44 and sc_cand > sc + 0.08:
                     sc, xy = sc_cand, xy_cand
-            # If local match is weak on an already-locked zone, do a throttled full-map re-acquisition
-            # (at most once every 1.5s, using only the locked/mid scales so it takes ~20ms instead of 350ms!)
+            # If local match is genuinely weak (< 0.42) on an already-locked zone, do a throttled
+            # full-map re-acquisition (every 1.5s if truly lost < 0.30, else every 3.0s).
+            # Keeping this threshold at 0.42 avoids 300ms+ full-map stalls when tracking cleanly at 0.45-0.51!
+            reacq_cd = 1.5 if sc < 0.30 else 3.0
             if (
                 not force_full_map
                 and prev_wxy is not None
-                and sc < 0.52
-                and (now_t - self._last_full_reacq_t) >= 1.5
+                and sc < 0.42
+                and (now_t - self._last_full_reacq_t) >= reacq_cd
             ):
                 self._last_full_reacq_t = now_t
-                reacq_scales = (scales_px[0],) if len(scales_px) == 1 else scales_px[::2]
+                reacq_radii = (
+                    (85.0, 115.0, 155.0, 210.0)
+                    if self._is_outdoor_zone.get(slug, False)
+                    else (62.0, 115.0, 155.0, 210.0)
+                ) if len(scales_px) > 4 else None
+                if reacq_radii is not None:
+                    r_sc = sorted(set(
+                        max(10, min(w_sz - 8, int(round(2.0 * r_yd * 0.62 * d.map_scale / ratio))))
+                        for r_yd in reacq_radii
+                    ))
+                    reacq_scales = tuple(r_sc)
+                else:
+                    reacq_scales = scales_px
                 sc_full, xy_full = self._match_single_dungeon(
                     slug, crop_sil, crop_edge, reacq_scales, angles_deg,
                     prev_work_xy=None, plausible_radius_work=None,
                     tpl_cache=tpl_cache,
                 )
-                if sc_full >= 0.56 and sc_full > sc + 0.12:
+                if sc_full >= 0.44 and sc_full > sc + 0.10:
                     sc, xy = sc_full, xy_full
-            # If locked-scale match dipped, immediately fall back to full multi-scale check
-            if use_locked_scale and sc < 0.52:
-                self._locked_zoom_yd = None
-                return eval_fine(slug, force_full_map=False)
-            if not use_locked_scale and slug == self.active_slug and sc >= 0.55:
+            if not use_locked_scale and slug == self.active_slug and sc >= 0.45:
                 # Pick the zoom radius whose scale best matched (update every 1.5s)
-                best_r = zoom_radii_yd[0]
+                best_r = slug_radii[0]
                 best_rs = -1.0
-                for r_yd in zoom_radii_yd:
+                for r_yd in slug_radii:
                     s_r = max(10, min(w_sz - 8, int(round(2.0 * r_yd * 0.62 * d.map_scale / ratio))))
                     sr, _ = self._match_single_dungeon(
                         slug, crop_sil, crop_edge, (s_r,), angles_deg,
@@ -1264,10 +1288,13 @@ class MinimapTracker:
         max_step_px = plausible_yd * d.map_scale
         cv_score_best = raw_cv_scores.get(best_slug)
         strong_cv_lock = (cv_score_best is not None and cv_score_best >= 0.72)
-        jump_match_ok = (
-            (cv_score_best is not None and cv_score_best >= 0.56)
+        jump_strong = (
+            (cv_score_best is not None and cv_score_best >= 0.54)
             or (cv_score_best is None and raw_scores.get(best_slug, 0.0) >= 0.72)
         )
+        jump_moderate = (cv_score_best is not None and cv_score_best >= 0.44)
+        jump_need_frames = 2 if jump_strong else 3
+        jump_match_ok = jump_strong or jump_moderate
         if self._smooth_px is None or (mode_tag == "Anchor" and strong_cv_lock):
             self._smooth_px = raw_px
             self._jump_cand_px = None
@@ -1276,8 +1303,9 @@ class MinimapTracker:
             step_px = float(np.linalg.norm(raw_px - self._smooth_px))
             if step_px <= max_step_px:
                 # Normal plausible movement (walking / running / sprinting / mounted)
-                # Hold position if OpenCV match is very weak (< 0.34) to prevent random drift in featureless terrain
-                if cv_score_best is not None and cv_score_best < 0.34:
+                # Hold position if OpenCV match is very weak (< 0.24) to prevent random drift in blank/dark frames
+                # while still tracking smoothly through icon-heavy city streets (e.g. Orgrimmar AH/Bank at 0.28-0.34).
+                if cv_score_best is not None and cv_score_best < 0.24:
                     pass
                 else:
                     self._smooth_px = 0.65 * raw_px + 0.35 * self._smooth_px
@@ -1294,8 +1322,8 @@ class MinimapTracker:
                     self._jump_cand_px = raw_px
                     self._jump_confirm_count = 1
 
-                if self._jump_confirm_count >= 2:
-                    # Confirmed teleport / summon / floor jump -> snap cleanly and reset trail
+                if self._jump_confirm_count >= jump_need_frames:
+                    # Confirmed teleport / summon / post-tunnel re-lock -> snap cleanly and reset trail
                     self._smooth_px = raw_px
                     self._jump_cand_px = None
                     self._jump_confirm_count = 0

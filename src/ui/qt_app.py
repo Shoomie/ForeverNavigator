@@ -795,29 +795,49 @@ class GPUMapViewport(QOpenGLWidget):
                 _folder, cont_slug, cx_cont, cy_cont, cont_per_ov = mapped
                 sc_cont = sc_ov / max(1e-6, cont_per_ov)
 
-                # Level 2: Async native 512px CASC viewport patch when deeply zoomed & settled
-                if not self.win._is_interacting and sc_cont >= 1.65:
-                    tile_key = (cont_slug, int(round(cx_cont)), int(round(cy_cont)), round(sc_cont, 3), int(cw), int(ch))
-                    if self.win._deep_tile_key == tile_key and "__deep_tile" in self._textures:
-                        tex = self._textures["__deep_tile"][0]
-                        self._draw_textured_quad(tex, 0.0, 0.0, cw, ch, cw, ch)
-                        drew_hi = True
-                    else:
-                        self.win._request_deep_tiles_async(cont_slug, cx_cont, cy_cont, sc_cont, int(cw), int(ch))
-
                 # Level 1: Prestitched 4096x4096 WoW: Forever continent GPU texture (0.1 ms GPU draw!)
-                if not drew_hi:
-                    l1_key = f"__l1_{cont_slug}"
-                    self.win._ensure_continent_l1_async(cont_slug)
-                    if l1_key in self._textures and cont_slug in self.win._cont_l1_native:
-                        tex = self._textures[l1_key][0]
-                        native_px = float(self.win._cont_l1_native[cont_slug])
-                        x0 = (0.0 - cx_cont) * sc_cont + cw * 0.5
-                        y0 = (0.0 - cy_cont) * sc_cont + ch * 0.5
-                        x1 = (native_px - cx_cont) * sc_cont + cw * 0.5
-                        y1 = (native_px - cy_cont) * sc_cont + ch * 0.5
-                        self._draw_textured_quad(tex, x0, y0, x1, y1, cw, ch)
-                        drew_hi = True
+                l1_key = f"__l1_{cont_slug}"
+                self.win._ensure_continent_l1_async(cont_slug)
+                if l1_key in self._textures and cont_slug in self.win._cont_l1_native:
+                    tex = self._textures[l1_key][0]
+                    native_px = float(self.win._cont_l1_native[cont_slug])
+                    x0 = (0.0 - cx_cont) * sc_cont + cw * 0.5
+                    y0 = (0.0 - cy_cont) * sc_cont + ch * 0.5
+                    x1 = (native_px - cx_cont) * sc_cont + cw * 0.5
+                    y1 = (native_px - cy_cont) * sc_cont + ch * 0.5
+                    self._draw_textured_quad(tex, x0, y0, x1, y1, cw, ch)
+                    drew_hi = True
+
+                # Level 2: Overscanned + directional pan-ahead native 512px CASC patch
+                if sc_cont >= 1.65:
+                    dt_rect = getattr(self.win, "_deep_tile_rect", None)
+                    need_req = True
+                    if dt_rect is not None and "__deep_tile" in self._textures:
+                        r_slug, r_cx, r_cy, r_sc, r_w, r_h = dt_rect
+                        zoom_ratio = sc_cont / max(1e-6, r_sc)
+                        if r_slug == cont_slug and 0.72 <= zoom_ratio <= 1.38:
+                            # Draw overscanned patch at its exact continent-space position (even while panning!)
+                            half_w_cont = (r_w * 0.5) / max(1e-6, r_sc)
+                            half_h_cont = (r_h * 0.5) / max(1e-6, r_sc)
+                            px0 = (r_cx - half_w_cont - cx_cont) * sc_cont + cw * 0.5
+                            py0 = (r_cy - half_h_cont - cy_cont) * sc_cont + ch * 0.5
+                            px1 = (r_cx + half_w_cont - cx_cont) * sc_cont + cw * 0.5
+                            py1 = (r_cy + half_h_cont - cy_cont) * sc_cont + ch * 0.5
+                            if px1 > 0.0 and px0 < cw and py1 > 0.0 and py0 < ch:
+                                tex = self._textures["__deep_tile"][0]
+                                self._draw_textured_quad(tex, px0, py0, px1, py1, cw, ch)
+                                drew_hi = True
+                            # Only request a new patch when viewport nears the overscan margin or zoom drifted
+                            margin_x = cw * 0.10
+                            margin_y = ch * 0.10
+                            covers_with_margin = (
+                                px0 <= -margin_x and py0 <= -margin_y
+                                and px1 >= cw + margin_x and py1 >= ch + margin_y
+                                and 0.85 <= zoom_ratio <= 1.18
+                            )
+                            need_req = not covers_with_margin
+                    if need_req:
+                        self.win._request_deep_tiles_async(cont_slug, cx_cont, cy_cont, sc_cont, int(cw), int(ch))
 
         # Level 0: 4K Azeroth world GPU texture
         if not drew_hi and "__azeroth_ov" in self._textures:
@@ -1479,7 +1499,11 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self._cont_l1_native: Dict[str, int] = {}
         self._cont_meta: Dict[str, Dict[str, Any]] = {}
         self._deep_tile_key: Optional[tuple] = None
+        self._deep_tile_rect: Optional[Tuple[str, float, float, float, int, int]] = None
         self._deep_tile_req_id: int = 0
+        self._overview_pan_dir: Tuple[float, float] = (0.0, 0.0)
+        self._world_vel_xy: Tuple[float, float] = (0.0, 0.0)
+        self._last_world_sample: Optional[Tuple[float, float, float, str]] = None
         self._last_roster_sig: Optional[tuple] = None
 
         self._zoom_target: Optional[float] = None
@@ -1508,7 +1532,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
         self._zoom_timer = QTimer(self)
         self._zoom_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._zoom_timer.setInterval(8)  # precise smooth 120 FPS zoom
+        self._zoom_timer.setInterval(16)  # precise smooth 60 FPS zoom
         self._zoom_timer.timeout.connect(self._step_smooth_zoom)
 
         self._settle_timer = QTimer(self)
@@ -1517,7 +1541,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
         self._trans_timer = QTimer(self)
         self._trans_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._trans_timer.setInterval(8)
+        self._trans_timer.setInterval(16)
         self._trans_timer.timeout.connect(self._step_fix_transition)
 
         self._load_azeroth_overview_async()
@@ -2026,12 +2050,22 @@ class ForeverNavigatorQtWindow(QMainWindow):
     def _request_deep_tiles_async(
         self, cont_slug: str, cx_cont: float, cy_cont: float, sc_cont: float, cw: int, ch: int
     ) -> None:
-        key = (cont_slug, int(round(cx_cont)), int(round(cy_cont)), round(sc_cont, 3), cw, ch)
+        # Render an overscanned (+40%) tile patch biased slightly ahead in the pan direction
+        # so panning stays sharp at native 512px CASC resolution with zero blur drop!
+        ov_w = min(2560, max(cw + 128, int(round(cw * 1.40))))
+        ov_h = min(1600, max(ch + 128, int(round(ch * 1.40))))
+        pdir_x, pdir_y = getattr(self, "_overview_pan_dir", (0.0, 0.0))
+        bias_x_cont = (pdir_x * cw * 0.14) / max(1e-6, sc_cont)
+        bias_y_cont = (pdir_y * ch * 0.14) / max(1e-6, sc_cont)
+        req_cx = cx_cont + bias_x_cont
+        req_cy = cy_cont + bias_y_cont
+        key = (cont_slug, int(round(req_cx / 24.0)), int(round(req_cy / 24.0)), round(sc_cont, 2), ov_w, ov_h)
         if self._deep_tile_key == key or getattr(self, "_deep_tile_inflight_key", None) == key:
             return
         self._deep_tile_req_id += 1
         req_id = self._deep_tile_req_id
         self._deep_tile_inflight_key = key
+        rect = (cont_slug, req_cx, req_cy, sc_cont, ov_w, ov_h)
 
         def _worker() -> None:
             arr = None
@@ -2041,13 +2075,13 @@ class ForeverNavigatorQtWindow(QMainWindow):
                 if self.world_maps is not None and self.world_maps.ensure_full_res_tiles(cont_slug):
                     if req_id != self._deep_tile_req_id or self._closing:
                         return
-                    vp = self.world_maps.render_full_res_viewport(cont_slug, cx_cont, cy_cont, sc_cont, cw, ch)
+                    vp = self.world_maps.render_full_res_viewport(cont_slug, req_cx, req_cy, sc_cont, ov_w, ov_h)
                     if vp is not None and req_id == self._deep_tile_req_id:
                         arr = _to_rgba_u8(np.asarray(vp, dtype=np.uint8))
             except Exception:
                 arr = None
             if not self._closing and req_id == self._deep_tile_req_id:
-                self._ui_queue.put(("deep_tile_ready", (req_id, key, arr)))
+                self._ui_queue.put(("deep_tile_ready", (req_id, key, rect, arr)))
 
         threading.Thread(target=_worker, daemon=True, name=f"QtDeepTile-{req_id}").start()
 
@@ -2244,12 +2278,16 @@ class ForeverNavigatorQtWindow(QMainWindow):
             self._cancel_fix_transition()
             self._zoom_timer.stop()
             self._zoom_target = None
-            self._deep_tile_key = None
             if self._azeroth_overview is not None:
                 cw, ch = max(1, self.viewport.width()), max(1, self.viewport.height())
                 sc_ov = self._overview_eff_scale(cw, ch)
                 self._overview_pan_x = max(0.0, min(float(self._azeroth_overview.width), self._overview_pan_x - dx / sc_ov))
                 self._overview_pan_y = max(0.0, min(float(self._azeroth_overview.height), self._overview_pan_y - dy / sc_ov))
+                # Track smoothed pan direction (camera moves opposite to mouse drag) for directional tile preloading
+                d_mag = math.hypot(dx, dy)
+                if d_mag > 0.5:
+                    odx, ody = self._overview_pan_dir
+                    self._overview_pan_dir = (0.65 * odx + 0.35 * (-dx / d_mag), 0.65 * ody + 0.35 * (-dy / d_mag))
                 self._is_interacting = True
                 self._settle_timer.start(100)
                 self.viewport.update()
@@ -2385,10 +2423,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.settings.fps = val
         save_settings(self.settings_path, self.settings)
         self.pill_fps.setText(f"{val:.0f} Hz" if val >= 5.0 else f"{val:.1f} Hz")
-        # Keep the visual glide timer at 120 FPS (8ms precise) regardless of capture polling Hz
+        # Keep the visual glide timer at 60 FPS (16ms precise) regardless of capture polling Hz
         # so 5 Hz polling still glides smoothly in both 2D and 3D viewports!
         if self.running and not self._poll_timer.isActive():
-            self._poll_timer.start(8)
+            self._poll_timer.start(16)
         self.lbl_stats.setText(f"Tracking polling rate: {lbl}")
 
     def _toggle_neural_model(self, enabled: bool) -> None:
@@ -2752,7 +2790,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
             if self._showing_azeroth_overview:
                 self.lbl_dungeon.setText("Azeroth Overview — Searching for Position Fix...")
             threading.Thread(target=self._capture_loop, daemon=True, name="QtCaptureLoop").start()
-            self._poll_timer.start(8)  # 120 FPS precise visual glide timer (skips repaint when stationary)
+            self._poll_timer.start(16)  # 60 FPS precise visual glide timer (skips repaint when stationary)
 
     def _capture_loop(self) -> None:
         last_fs_grab_t = 0.0
@@ -2984,41 +3022,93 @@ class ForeverNavigatorQtWindow(QMainWindow):
         threading.Thread(target=_load_nn, daemon=True, name=f"QtNeuralZone-{slug}").start()
 
     def _maybe_stream_nearby_zones(self, est: TrackerEstimate) -> None:
-        """Auto-load any containing or adjacent WoW: Forever city/zone (e.g. Orgrimmar from Durotar)."""
+        """Preload adjacent/ahead-of-travel WoW: Forever cities & zones + their full-res GPU textures."""
         if self.world_maps is None or est.position_confidence < 0.35:
             return
         now_t = time.perf_counter()
-        if now_t - getattr(self, "_last_nearby_check_t", 0.0) < 3.0:
+        wx, wy = float(est.world_pos[0]), float(est.world_pos[1])
+
+        # Update smoothed world travel velocity (yd/s) for directional lookahead preloading
+        prev_s = getattr(self, "_last_world_sample", None)
+        if prev_s is not None and prev_s[3] == est.dungeon_slug:
+            dt_w = now_t - prev_s[2]
+            if 0.08 <= dt_w <= 4.0:
+                ivx = (wx - prev_s[0]) / dt_w
+                ivy = (wy - prev_s[1]) / dt_w
+                if math.hypot(ivx, ivy) <= 60.0:  # ignore teleports
+                    ovx, ovy = self._world_vel_xy
+                    self._world_vel_xy = (0.70 * ovx + 0.30 * ivx, 0.70 * ovy + 0.30 * ivy)
+        self._last_world_sample = (wx, wy, now_t, est.dungeon_slug)
+
+        if now_t - getattr(self, "_last_nearby_check_t", 0.0) < 2.0:
             return
         self._last_nearby_check_t = now_t
         active_entry = self.world_maps.get_entry(est.dungeon_slug)
         if active_entry is None or not active_entry.minimap_folder:
             return
-        wx, wy = float(est.world_pos[0]), float(est.world_pos[1])
         folder = active_entry.minimap_folder
+
+        # Pre-warm the surrounding 4K continent background texture so zooming out never shows blank margins
+        cont_slug = "kalimdor" if folder == "Kalimdor" else ("eastern_kingdoms" if folder == "Azeroth" else None)
+        if cont_slug:
+            self._ensure_continent_l1_async(cont_slug)
+
+        # Build current + directional lookahead probe points (especially ahead in traveled direction!)
+        vx, vy = self._world_vel_xy
+        spd = math.hypot(vx, vy)
+        probes: List[Tuple[float, float, float, int]] = [(wx, wy, 520.0, 1)]
+        if spd >= 2.0:
+            ux, uy = vx / spd, vy / spd
+            # Prioritize zones directly ahead (~650 yd and ~1150 yd for mounts/flight paths)
+            probes.insert(0, (wx + ux * 650.0, wy + uy * 650.0, 460.0, 0))
+            if spd >= 10.0:
+                probes.append((wx + ux * 1150.0, wy + uy * 1150.0, 380.0, 0))
+
         loading_set = getattr(self, "_nearby_loading", None)
         if loading_set is None:
             loading_set = set()
             self._nearby_loading = loading_set
-        pad = 320.0
+
+        candidates: List[Tuple[int, float, Any]] = []
         for e in self._all_map_entries:
-            if e.slug in self.tracker_3d.dungeons or e.slug in loading_set:
-                continue
-            if e.minimap_folder != folder or e.category not in ("Cities", "Zones") or e.bounds_xy is None:
+            if e.slug == est.dungeon_slug or e.minimap_folder != folder or e.category not in ("Cities", "Zones") or e.bounds_xy is None:
                 continue
             xmin, ymin, xmax, ymax = e.bounds_xy
-            if (xmin - pad) <= wx <= (xmax + pad) and (ymin - pad) <= wy <= (ymax + pad):
-                loading_set.add(e.slug)
+            best_prio = None
+            best_d = 1e9
+            for px_p, py_p, pad, prio in probes:
+                if (xmin - pad) <= px_p <= (xmax + pad) and (ymin - pad) <= py_p <= (ymax + pad):
+                    cx_e = 0.5 * (xmin + xmax)
+                    cy_e = 0.5 * (ymin + ymax)
+                    dist_e = math.hypot(px_p - cx_e, py_p - cy_e)
+                    if best_prio is None or (prio, dist_e) < (best_prio, best_d):
+                        best_prio, best_d = prio, dist_e
+            if best_prio is not None:
+                candidates.append((best_prio, best_d, e))
 
-                def _load_nb(s: str = e.slug) -> None:
-                    try:
-                        d = self.world_maps.load_map(s, preview_only=True)
-                        if not self._closing and d is not None:
-                            self._ui_queue.put(("map_cached_register", (s, d)))
-                    except Exception:
-                        pass
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        started = 0
+        for _prio, _dist, e in candidates:
+            if e.slug in self.tracker_3d.dungeons:
+                # Already registered: pre-stream its full-res GPU texture into VRAM ahead of arrival!
+                d_nb = self.tracker_3d.dungeons[e.slug]
+                self._ensure_zone_texture(e.slug, d_nb)
+                continue
+            if e.slug in loading_set:
+                continue
+            loading_set.add(e.slug)
+            started += 1
 
-                threading.Thread(target=_load_nb, daemon=True, name=f"QtNearby-{e.slug}").start()
+            def _load_nb(s: str = e.slug) -> None:
+                try:
+                    d = self.world_maps.load_map(s, preview_only=True)
+                    if not self._closing and d is not None:
+                        self._ui_queue.put(("map_cached_register_prewarm", (s, d)))
+                except Exception:
+                    pass
+
+            threading.Thread(target=_load_nb, daemon=True, name=f"QtNearby-{e.slug}").start()
+            if started >= 2:
                 break
 
     # --- UI Queue Drain ---
@@ -3056,11 +3146,12 @@ class ForeverNavigatorQtWindow(QMainWindow):
                     self.viewport.queue_texture_upload_rgba(f"__l1_{cont_slug}", arr_rgba, build_mips=True)
                     needs_update = True
             elif kind == "deep_tile_ready":
-                req_id, key, arr_rgba = payload
+                req_id, key, rect, arr_rgba = payload
                 if getattr(self, "_deep_tile_inflight_key", None) == key:
                     self._deep_tile_inflight_key = None
-                if req_id == self._deep_tile_req_id and arr_rgba is not None and not self._is_interacting:
+                if req_id == self._deep_tile_req_id and arr_rgba is not None:
                     self._deep_tile_key = key
+                    self._deep_tile_rect = rect
                     self.viewport.queue_texture_upload_rgba("__deep_tile", arr_rgba, build_mips=False)
                     needs_update = True
             elif kind == "zone_fullres_loaded":
@@ -3085,6 +3176,13 @@ class ForeverNavigatorQtWindow(QMainWindow):
                 if dungeon is not None and slug not in self.tracker_3d.dungeons:
                     self.tracker_3d.register_dungeon(dungeon)
                     self.tracker_mm.register_dungeon(dungeon)
+            elif kind == "map_cached_register_prewarm":
+                slug, dungeon = payload
+                if dungeon is not None:
+                    if slug not in self.tracker_3d.dungeons:
+                        self.tracker_3d.register_dungeon(dungeon)
+                        self.tracker_mm.register_dungeon(dungeon)
+                    self._ensure_zone_texture(slug, dungeon)
             elif kind == "map_loaded":
                 slug, dungeon, err = payload
                 if err is not None or dungeon is None:
