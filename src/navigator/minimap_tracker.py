@@ -876,12 +876,30 @@ class MinimapTracker:
                 prev_work_xy=prev_wxy, plausible_radius_work=plaus_w,
                 tpl_cache=tpl_cache,
             )
+            # If the previous frame proposed a high-confidence jump/re-acquisition candidate,
+            # also check a tight local window around that candidate so 2-frame confirmation
+            # never deadlocks against the 1.5s full-map re-acquisition throttle!
+            if (
+                not force_full_map
+                and slug == self.active_slug
+                and self._jump_cand_px is not None
+                and prev_wxy is not None
+            ):
+                cand_wxy = (float(self._jump_cand_px[0]) / ratio, float(self._jump_cand_px[1]) / ratio)
+                cand_plaus_w = max(plaus_w or 12.0, (35.0 * d.map_scale) / ratio)
+                sc_cand, xy_cand = self._match_single_dungeon(
+                    slug, crop_sil, crop_edge, scales_px, angles_deg,
+                    prev_work_xy=cand_wxy, plausible_radius_work=cand_plaus_w,
+                    tpl_cache=tpl_cache,
+                )
+                if sc_cand >= 0.56 and sc_cand > sc + 0.08:
+                    sc, xy = sc_cand, xy_cand
             # If local match is weak on an already-locked zone, do a throttled full-map re-acquisition
             # (at most once every 1.5s, using only the locked/mid scales so it takes ~20ms instead of 350ms!)
             if (
                 not force_full_map
                 and prev_wxy is not None
-                and sc < 0.46
+                and sc < 0.52
                 and (now_t - self._last_full_reacq_t) >= 1.5
             ):
                 self._last_full_reacq_t = now_t
@@ -891,7 +909,7 @@ class MinimapTracker:
                     prev_work_xy=None, plausible_radius_work=None,
                     tpl_cache=tpl_cache,
                 )
-                if sc_full >= 0.56 and sc_full > sc + 0.14:
+                if sc_full >= 0.56 and sc_full > sc + 0.12:
                     sc, xy = sc_full, xy_full
             # If locked-scale match dipped, immediately fall back to full multi-scale check
             if use_locked_scale and sc < 0.52:
@@ -1203,6 +1221,7 @@ class MinimapTracker:
         if best_slug != self.active_slug:
             self.active_slug = best_slug
             self._smooth_px = None
+            self._locked_zoom_yd = None
             self._jump_cand_px = None
             self._jump_confirm_count = 0
             self._switch_cand_slug = None
@@ -1246,7 +1265,7 @@ class MinimapTracker:
         cv_score_best = raw_cv_scores.get(best_slug)
         strong_cv_lock = (cv_score_best is not None and cv_score_best >= 0.72)
         jump_match_ok = (
-            (cv_score_best is not None and cv_score_best >= 0.62)
+            (cv_score_best is not None and cv_score_best >= 0.56)
             or (cv_score_best is None and raw_scores.get(best_slug, 0.0) >= 0.72)
         )
         if self._smooth_px is None or (mode_tag == "Anchor" and strong_cv_lock):
