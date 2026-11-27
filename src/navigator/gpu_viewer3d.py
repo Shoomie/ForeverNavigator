@@ -7,6 +7,7 @@ user's local World of Warcraft installation (never redistributing Blizzard 3D as
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -321,6 +322,9 @@ class GPU3DViewer:
         self.brightness: float = 1.0
         self.target: Optional[np.ndarray] = None
         self._last_player_z: Optional[float] = None
+        self._smooth_z_slug: Optional[str] = None
+        self._last_render_t: float = 0.0
+        self._target_gliding: bool = False
 
     def set_wow_dir(self, wow_dir: str | Path) -> None:
         """Switch WoW installation path and reload CASC cleanly on next 3D render."""
@@ -492,13 +496,33 @@ class GPU3DViewer:
         if self.target is None:
             self.target = scene.center.copy()
 
+        now_t = time.perf_counter()
+        dt = max(0.001, min(0.10, now_t - self._last_render_t)) if self._last_render_t > 0.0 else 0.016
+        self._last_render_t = now_t
+        self._target_gliding = False
+
         p3d: Optional[np.ndarray] = None
         if player_world is not None:
-            pz = self.snap_world_z(d, player_world[:2], prefer_z=self._last_player_z)
+            raw_z = self.snap_world_z(d, player_world[:2], prefer_z=self._last_player_z if self._smooth_z_slug == slug else None)
+            if self._last_player_z is None or self._smooth_z_slug != slug or abs(raw_z - self._last_player_z) > 25.0:
+                pz = raw_z
+            else:
+                z_alpha = 1.0 - math.exp(-dt / 0.14)
+                pz = self._last_player_z + (raw_z - self._last_player_z) * z_alpha
+                if abs(raw_z - pz) > 0.05:
+                    self._target_gliding = True
             self._last_player_z = pz
+            self._smooth_z_slug = slug
             p3d = np.array([float(player_world[0]), float(player_world[1]), pz], dtype=np.float32)
             if follow_player:
-                self.target = p3d.copy()
+                diff = p3d - self.target
+                dist3 = float(np.linalg.norm(diff))
+                if dist3 > 45.0:
+                    self.target = p3d.copy()
+                elif dist3 > 0.03:
+                    cam_alpha = 1.0 - math.exp(-dt / 0.16)
+                    self.target = self.target + diff * cam_alpha
+                    self._target_gliding = True
 
         # Orbit camera
         yaw = math.radians(self.yaw_deg)
@@ -802,13 +826,33 @@ class GPU3DViewer:
         if self.target is None:
             self.target = scene.center.copy()
 
+        now_t = time.perf_counter()
+        dt = max(0.001, min(0.10, now_t - self._last_render_t)) if self._last_render_t > 0.0 else 0.016
+        self._last_render_t = now_t
+        self._target_gliding = False
+
         p3d: Optional[np.ndarray] = None
         if player_world is not None:
-            pz = self.snap_world_z(d, player_world[:2], prefer_z=self._last_player_z)
+            raw_z = self.snap_world_z(d, player_world[:2], prefer_z=self._last_player_z if self._smooth_z_slug == slug else None)
+            if self._last_player_z is None or self._smooth_z_slug != slug or abs(raw_z - self._last_player_z) > 25.0:
+                pz = raw_z
+            else:
+                z_alpha = 1.0 - math.exp(-dt / 0.14)
+                pz = self._last_player_z + (raw_z - self._last_player_z) * z_alpha
+                if abs(raw_z - pz) > 0.05:
+                    self._target_gliding = True
             self._last_player_z = pz
+            self._smooth_z_slug = slug
             p3d = np.array([float(player_world[0]), float(player_world[1]), pz], dtype=np.float32)
             if follow_player:
-                self.target = p3d.copy()
+                diff = p3d - self.target
+                dist3 = float(np.linalg.norm(diff))
+                if dist3 > 45.0:
+                    self.target = p3d.copy()
+                elif dist3 > 0.03:
+                    cam_alpha = 1.0 - math.exp(-dt / 0.16)
+                    self.target = self.target + diff * cam_alpha
+                    self._target_gliding = True
 
         yaw = math.radians(self.yaw_deg)
         pitch = math.radians(self.pitch_deg)

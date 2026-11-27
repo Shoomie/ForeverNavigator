@@ -62,7 +62,7 @@ from ..combatlog.parser import iter_combatlog_file
 from ..combatlog.stats import analyze_combat_events
 from ..navigator.dev_logger import DevGameplayLogger
 from ..navigator.fast_capture import FastScreenCapturer
-from ..navigator.gpu_viewer3d import GPU3DViewer, find_wow_dir
+from ..navigator.gpu_viewer3d import DUNGEON_WMO_FDIDS, GPU3DViewer, find_wow_dir
 from ..navigator.minimap_tracker import MinimapROI, MinimapTracker, load_roi, save_roi
 from ..navigator.settings import (
     AppSettings,
@@ -843,6 +843,15 @@ class GPUMapViewport(QOpenGLWidget):
             self.win._request_3d_scene_async(slug)
             return
 
+        player_world_3d = None
+        if self.win._latest_est is not None:
+            rpx = getattr(self.win, "_render_px", None)
+            if rpx is not None and getattr(self.win, "_render_px_slug", None) == slug:
+                wx, wy = d.map_px_to_world(float(rpx[0]), float(rpx[1]))
+                player_world_3d = np.array([wx, wy, float(self.win._latest_est.world_pos[2])], dtype=np.float32)
+            else:
+                player_world_3d = self.win._latest_est.world_pos
+
         self.win.viewer_3d.render_direct_gl(
             self._mgl,
             fbo,
@@ -850,7 +859,7 @@ class GPUMapViewport(QOpenGLWidget):
             d,
             int(max(1, cw)),
             int(max(1, ch)),
-            player_world=self.win._latest_est.world_pos if self.win._latest_est else None,
+            player_world=player_world_3d,
             follow_player=self.win.chk_follow.isChecked(),
         )
 
@@ -1494,10 +1503,12 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self._queue_timer.start(30)
 
         self._poll_timer = QTimer(self)
+        self._poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._poll_timer.timeout.connect(self._poll_tracker)
 
         self._zoom_timer = QTimer(self)
-        self._zoom_timer.setInterval(8)  # vsync-paced smooth 60-144 FPS zoom
+        self._zoom_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._zoom_timer.setInterval(8)  # precise smooth 120 FPS zoom
         self._zoom_timer.timeout.connect(self._step_smooth_zoom)
 
         self._settle_timer = QTimer(self)
@@ -1505,7 +1516,8 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self._settle_timer.timeout.connect(self._on_interaction_settled)
 
         self._trans_timer = QTimer(self)
-        self._trans_timer.setInterval(12)
+        self._trans_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._trans_timer.setInterval(8)
         self._trans_timer.timeout.connect(self._step_fix_transition)
 
         self._load_azeroth_overview_async()
@@ -1538,8 +1550,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.pill_sync.clicked.connect(lambda: QtRaidSyncDialog(self).exec())
         self.pill_pos = QLabel("Pos: --")
         self.pill_pos.setObjectName("Pill")
+        self.pill_pos.setMinimumWidth(165)
         self.pill_fps = QLabel(f"{self.fps:.1f} Hz")
         self.pill_fps.setObjectName("Pill")
+        self.pill_fps.setMinimumWidth(155)
         tl.addWidget(self.pill_sync)
         tl.addWidget(self.pill_pos)
         tl.addWidget(self.pill_fps)
@@ -2371,10 +2385,10 @@ class ForeverNavigatorQtWindow(QMainWindow):
         self.settings.fps = val
         save_settings(self.settings_path, self.settings)
         self.pill_fps.setText(f"{val:.0f} Hz" if val >= 5.0 else f"{val:.1f} Hz")
-        # Keep the visual glide timer at 60 FPS (16ms) regardless of capture polling Hz
-        # so 5 Hz polling still glides smoothly in the viewport!
+        # Keep the visual glide timer at 120 FPS (8ms precise) regardless of capture polling Hz
+        # so 5 Hz polling still glides smoothly in both 2D and 3D viewports!
         if self.running and not self._poll_timer.isActive():
-            self._poll_timer.start(16)
+            self._poll_timer.start(8)
         self.lbl_stats.setText(f"Tracking polling rate: {lbl}")
 
     def _toggle_neural_model(self, enabled: bool) -> None:
@@ -2496,17 +2510,28 @@ class ForeverNavigatorQtWindow(QMainWindow):
         threading.Thread(target=lambda: self.tracker_mm.set_high_precision(bool(enabled)), daemon=True).start()
         self.lbl_stats.setText(f"Tracking mode: {'High Precision (CPU+GPU)' if enabled else 'Standard'}")
 
-    def _toggle_3d_view(self) -> None:
-        self.view_3d_mode = not self.view_3d_mode
+    def _set_3d_view(self, enabled: bool, status_msg: Optional[str] = None) -> None:
+        enabled = bool(enabled)
+        if self.view_3d_mode == enabled:
+            return
+        self.view_3d_mode = enabled
         self._scene_3d_error = None
         self.btn_view3d.setText("View: 3D Model (GPU)" if self.view_3d_mode else "View: 2D Map (GPU)")
         self.btn_view3d.setObjectName("Purple" if self.view_3d_mode else "")
         self.btn_view3d.style().unpolish(self.btn_view3d)
         self.btn_view3d.style().polish(self.btn_view3d)
+        if status_msg:
+            self.lbl_stats.setText(status_msg)
         if self.view_3d_mode:
             self._render_3d_frame()
         else:
+            if self.chk_follow.isChecked() and getattr(self, "_render_px", None) is not None:
+                self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
+                self._pan_vel = (0.0, 0.0)
             self.viewport.update()
+
+    def _toggle_3d_view(self) -> None:
+        self._set_3d_view(not self.view_3d_mode)
 
     def _request_3d_scene_async(self, slug: str) -> None:
         loading = getattr(self, "_scene_3d_loading", None)
@@ -2727,7 +2752,7 @@ class ForeverNavigatorQtWindow(QMainWindow):
             if self._showing_azeroth_overview:
                 self.lbl_dungeon.setText("Azeroth Overview — Searching for Position Fix...")
             threading.Thread(target=self._capture_loop, daemon=True, name="QtCaptureLoop").start()
-            self._poll_timer.start(16)  # 60 FPS visual interpolation timer (skips repaint when stationary)
+            self._poll_timer.start(8)  # 120 FPS precise visual glide timer (skips repaint when stationary)
 
     def _capture_loop(self) -> None:
         last_fs_grab_t = 0.0
@@ -2815,44 +2840,77 @@ class ForeverNavigatorQtWindow(QMainWindow):
 
         if is_new_est:
             self._last_rendered_est = est
-            self.pill_pos.setText(f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%")
-            self.lbl_dungeon.setText(f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]")
+            # Auto-switch from 3D WMO view back to 2D Map when exiting a dungeon into an outdoor area
+            if (
+                self.view_3d_mode
+                and est.dungeon_slug not in DUNGEON_WMO_FDIDS
+                and self.tracker_mm._is_outdoor_zone.get(est.dungeon_slug, False)
+                and est.dungeon_confidence >= 0.70
+                and est.position_confidence >= 0.45
+            ):
+                self._set_3d_view(False, status_msg=f"Auto-switched to 2D Map (outdoor area: {est.dungeon_name})")
+            pos_txt = f"Pos: ({est.world_pos[0]:.0f}, {est.world_pos[1]:.0f}) {est.position_confidence * 100:.0f}%"
+            if pos_txt != getattr(self, "_last_pos_txt", ""):
+                self._last_pos_txt = pos_txt
+                self.pill_pos.setText(pos_txt)
+            dung_txt = f"{est.dungeon_name}  [{est.dungeon_confidence * 100:.0f}% | {len(self.raid_players)} synced]"
+            if dung_txt != getattr(self, "_last_dung_txt", ""):
+                self._last_dung_txt = dung_txt
+                self.lbl_dungeon.setText(dung_txt)
 
-        # Time-based 60 FPS visual glide toward the latest tracker position.
-        # Adapts the glide time constant to the polling rate (e.g. tau=0.15s at 5 Hz) so
-        # both the player marker and follow-camera map shift softly with zero lurch-pause!
+        # Critically-damped spring (SmoothDamp) at 120 FPS toward the latest tracker position.
+        # C1-continuous velocity eliminates "slow-down-then-speed-up" micro-stutters between 5 Hz updates
+        # while never overshooting — and drives both 2D and 3D smooth movement!
         last_vis_t = getattr(self, "_last_vis_t", 0.0)
-        vis_dt = max(0.001, min(0.10, now_ui - last_vis_t)) if last_vis_t > 0.0 else 0.016
+        vis_dt = max(0.001, min(0.05, now_ui - last_vis_t)) if last_vis_t > 0.0 else 0.008
         self._last_vis_t = now_ui
 
         target_px = getattr(self.tracker_mm, "last_smooth_px", None) or (float(est.map_px[0]), float(est.map_px[1]))
         prev_slug = getattr(self, "_render_px_slug", None)
         cur_rpx = getattr(self, "_render_px", None)
+        vel_x, vel_y = getattr(self, "_render_vel", (0.0, 0.0))
         moved_vis = False
         snapped = False
         if cur_rpx is None or prev_slug != est.dungeon_slug:
             self._render_px = (float(target_px[0]), float(target_px[1]))
+            self._render_vel = (0.0, 0.0)
             self._render_px_slug = est.dungeon_slug
             moved_vis = True
             snapped = True
         else:
-            dx = float(target_px[0]) - cur_rpx[0]
-            dy = float(target_px[1]) - cur_rpx[1]
+            tx, ty = float(target_px[0]), float(target_px[1])
+            dx = cur_rpx[0] - tx
+            dy = cur_rpx[1] - ty
             dist = math.hypot(dx, dy)
+            speed = math.hypot(vel_x, vel_y)
             if dist > 140.0:
-                self._render_px = (float(target_px[0]), float(target_px[1]))
+                self._render_px = (tx, ty)
+                self._render_vel = (0.0, 0.0)
                 moved_vis = True
                 snapped = True
-            elif dist > 0.03:
-                tau = max(0.045, min(0.24, 0.75 / max(1.0, self.fps)))
-                alpha = 1.0 - math.exp(-vis_dt / tau)
-                self._render_px = (cur_rpx[0] + dx * alpha, cur_rpx[1] + dy * alpha)
+            elif dist > 0.02 or speed > 0.2:
+                # Analytical critically-damped spring (never overshoots, C1 velocity continuity)
+                smooth_time = max(0.055, min(0.22, 0.72 / max(1.0, self.fps)))
+                omega = 2.0 / smooth_time
+                x_om = omega * vis_dt
+                exp_f = 1.0 / (1.0 + x_om + 0.48 * x_om * x_om + 0.235 * x_om * x_om * x_om)
+                tmp_x = (vel_x + omega * dx) * vis_dt
+                tmp_y = (vel_y + omega * dy) * vis_dt
+                vel_x = (vel_x - omega * tmp_x) * exp_f
+                vel_y = (vel_y - omega * tmp_y) * exp_f
+                nx = tx + (dx + tmp_x) * exp_f
+                ny = ty + (dy + tmp_y) * exp_f
+                self._render_px = (nx, ny)
+                self._render_vel = (vel_x, vel_y)
                 moved_vis = True
 
         pan_needs_glide = (
             self.chk_follow.isChecked()
             and self._render_px is not None
-            and math.hypot(self._render_px[0] - self.pan_x, self._render_px[1] - self.pan_y) > 0.03
+            and (
+                (not self.view_3d_mode and math.hypot(self._render_px[0] - self.pan_x, self._render_px[1] - self.pan_y) > 0.02)
+                or (self.view_3d_mode and getattr(self.viewer_3d, "_target_gliding", False))
+            )
         )
         if self._showing_azeroth_overview and self._transition_state is None:
             if is_new_est:
@@ -2860,26 +2918,36 @@ class ForeverNavigatorQtWindow(QMainWindow):
                 if self._is_good_position_fix(est):
                     self._start_fix_transition(est)
         elif self._transition_state is None and (is_new_est or moved_vis or pan_needs_glide):
-            if self.chk_follow.isChecked() and self._render_px is not None:
+            if self.chk_follow.isChecked() and self._render_px is not None and not self.view_3d_mode:
                 if snapped:
                     self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
+                    self._pan_vel = (0.0, 0.0)
                 else:
-                    pdx = self._render_px[0] - self.pan_x
-                    pdy = self._render_px[1] - self.pan_y
+                    pvx, pvy = getattr(self, "_pan_vel", (0.0, 0.0))
+                    pdx = self.pan_x - self._render_px[0]
+                    pdy = self.pan_y - self._render_px[1]
                     pdist = math.hypot(pdx, pdy)
                     if pdist > 140.0:
                         self.pan_x, self.pan_y = self._render_px[0], self._render_px[1]
-                    elif pdist > 0.03:
-                        pan_tau = max(0.06, min(0.26, 0.85 / max(1.0, self.fps)))
-                        pan_alpha = 1.0 - math.exp(-vis_dt / pan_tau)
-                        self.pan_x += pdx * pan_alpha
-                        self.pan_y += pdy * pan_alpha
+                        self._pan_vel = (0.0, 0.0)
+                    elif pdist > 0.02 or math.hypot(pvx, pvy) > 0.2:
+                        pan_smooth = max(0.065, min(0.24, 0.80 / max(1.0, self.fps)))
+                        p_om = 2.0 / pan_smooth
+                        px_om = p_om * vis_dt
+                        p_exp = 1.0 / (1.0 + px_om + 0.48 * px_om * px_om + 0.235 * px_om * px_om * px_om)
+                        ptmp_x = (pvx + p_om * pdx) * vis_dt
+                        ptmp_y = (pvy + p_om * pdy) * vis_dt
+                        pvx = (pvx - p_om * ptmp_x) * p_exp
+                        pvy = (pvy - p_om * ptmp_y) * p_exp
+                        self.pan_x = self._render_px[0] + (pdx + ptmp_x) * p_exp
+                        self.pan_y = self._render_px[1] + (pdy + ptmp_y) * p_exp
+                        self._pan_vel = (pvx, pvy)
                         moved_vis = True
             if is_new_est:
                 self._maybe_autoload_neural_zone()
                 self._maybe_stream_nearby_zones(est)
             if self.view_3d_mode:
-                if is_new_est or moved_vis:
+                if is_new_est or moved_vis or pan_needs_glide:
                     self._render_3d_frame()
             else:
                 self.viewport.update()
